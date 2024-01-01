@@ -1,0 +1,21 @@
+# Compiled Object files, Static and Dynamic libs (Shared Objects)
+*.o
+*.a
+*.so
+
+# Folders
+_vendor/
+bin/
+release/
+
+# Go specific
+*.exe
+*.test
+*.prof
+*.out
+*.test
+*.tmp
+
+# Dependency directories
+Godeps/
+vendor/
