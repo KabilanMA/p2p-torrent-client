@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hyperfast Torrent Client</title>
+<style>
+:root {
+  --bg:       #0d1117;
+  --surface:  #161b22;
+  --border:   #30363d;
+  --accent:   #238636;
+  --accent2:  #1f6feb;
+  --danger:   #da3633;
+  --warning:  #9e6a03;
+  --text:     #e6edf3;
+  --muted:    #8b949e;
+  --radius:   8px;
+  --mono:     'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 24px 16px 56px;
+}
+h1 {
+  font-size: 22px;
+  font-weight: 700;
+  margin-bottom: 24px;
+  letter-spacing: -0.3px;
+  align-self: flex-start;
+  max-width: 760px;
+  width: 100%;
+}
+h1 span { color: var(--accent2); }
+
+/* ── Layout ── */
+.layout { width: 100%; max-width: 760px; display: flex; flex-direction: column; gap: 14px; }
+
+/* ── Card ── */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+}
+.card-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: .6px;
+  margin-bottom: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+/* ── Tabs ── */
+.tabs { display: flex; gap: 2px; margin-bottom: 14px; }
+.tab {
+  flex: 1;
+  padding: 7px 14px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  text-align: center;
+  transition: all .15s;
+}
+.tab.active { background: var(--accent2); border-color: var(--accent2); color: #fff; }
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+/* ── Inputs ── */
+label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
+input[type=text], input[type=number] {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  padding: 8px 12px;
+  font-size: 13px;
+  outline: none;
+  transition: border-color .15s;
+}
+input[type=text]:focus, input[type=number]:focus { border-color: var(--accent2); }
+input[type=file] { display: none; }
+.file-drop-area {
+  border: 2px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 28px 16px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color .15s, background .15s;
+  font-size: 13px;
+  color: var(--muted);
+}
+.file-drop-area:hover, .file-drop-area.dragover {
+  border-color: var(--accent2);
+  background: rgba(31,111,235,.05);
+  color: var(--text);
+}
+.file-drop-area.has-file { border-color: var(--accent); background: rgba(35,134,54,.07); color: var(--text); }
+.file-name { font-weight: 600; word-break: break-all; }
+
+/* ── Dir row ── */
+.dir-row { display: flex; gap: 8px; }
+.dir-row input { flex: 1; }
+
+/* ── Options row ── */
+.row { display: flex; gap: 10px; align-items: flex-end; margin-top: 12px; }
+.row > * { flex: 1; }
+details { margin-top: 12px; }
+details summary {
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+details summary::before { content: '▶'; font-size: 10px; transition: transform .15s; }
+details[open] summary::before { transform: rotate(90deg); }
+.verbose-select {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  padding: 8px 12px;
+  font-size: 13px;
+  outline: none;
+}
+select option { background: var(--surface); }
+
+/* ── Buttons ── */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 9px 20px;
+  border: none;
+  border-radius: var(--radius);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity .15s, filter .15s;
+}
+.btn:disabled { opacity: .4; cursor: not-allowed; }
+.btn-primary   { background: var(--accent);  color: #fff; width: 100%; margin-top: 14px; }
+.btn-secondary { background: var(--accent2); color: #fff; }
+.btn-danger    { background: var(--danger);  color: #fff; }
+.btn-sm        { padding: 6px 14px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+.btn:not(:disabled):hover { filter: brightness(1.15); }
+
+/* ── Queue section ── */
+.section-header {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: .6px;
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.q-count {
+  background: var(--border);
+  color: var(--muted);
+  border-radius: 99px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+}
+
+/* ── Download card ── */
+.dl-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin-bottom: 10px;
+  transition: border-color .2s;
+}
+.dl-card.status-running  { border-left: 3px solid var(--accent2); }
+.dl-card.status-done     { border-left: 3px solid var(--accent);  }
+.dl-card.status-error    { border-left: 3px solid var(--danger);  }
+.dl-card.status-cancelled{ border-left: 3px solid var(--border);  }
+
+.dl-card-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.dl-name {
+  font-size: 14px;
+  font-weight: 600;
+  word-break: break-all;
+  flex: 1;
+}
+.dl-badge {
+  flex-shrink: 0;
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 99px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.badge-running   { background: var(--accent2); color: #fff; }
+.badge-done      { background: var(--accent);  color: #fff; }
+.badge-error     { background: var(--danger);  color: #fff; }
+.badge-cancelled { background: var(--border);  color: var(--muted); }
+
+.progress-track {
+  background: var(--border);
+  border-radius: 99px;
+  height: 6px;
+  overflow: hidden;
+  margin-bottom: 8px;
+}
+.progress-bar {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--accent2), var(--accent));
+  border-radius: 99px;
+  transition: width .4s ease;
+}
+.dl-stats {
+  font-size: 12px;
+  color: var(--muted);
+  min-height: 18px;
+  margin-bottom: 8px;
+  font-family: var(--mono);
+}
+.dl-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.dl-output {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 480px;
+}
+.dl-error { font-size: 12px; color: #ff7b72; margin-top: 4px; }
+
+/* ── Log ── */
+.log-area {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-family: var(--mono);
+  font-size: 12px;
+  color: #7ee787;
+  padding: 12px 14px;
+  height: 220px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.log-area:empty::before { content: 'Waiting for activity…'; color: var(--muted); }
+.log-line         { line-height: 1.6; }
+.log-line.error   { color: #ff7b72; }
+.log-line.engine  { color: #79c0ff; }
+.log-line.progress{ color: #56d364; }
+.log-prefix { color: var(--muted); margin-right: 6px; }
+
+/* ── Magnet badges / hints ── */
+@keyframes fadein { from { opacity:0; transform:scale(.85); } to { opacity:1; transform:scale(1); } }
+#clean-badge { animation: fadein .2s ease; }
+@keyframes shake {
+  0%,100% { transform: translateX(0); }
+  20%,60% { transform: translateX(-4px); }
+  40%,80% { transform: translateX( 4px); }
+}
+.input-error { animation: shake .3s ease; border-color: var(--danger) !important; }
+
+/* ── Toast ── */
+#toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%) translateY(80px);
+  background: #21262d;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 20px;
+  font-size: 13px;
+  color: var(--muted);
+  transition: transform .3s ease;
+  z-index: 99;
+  pointer-events: none;
+}
+#toast.show { transform: translateX(-50%) translateY(0); }
+</style>
+</head>
+<body>
+
+<h1>⚡ Hyper<span>fast</span> Torrent Client</h1>
+
+<div class="layout">
+
+<!-- ── Add Download card ─────────────────────────────────────────────────── -->
+<div class="card">
+  <div class="card-title">Add Download</div>
+
+  <div class="tabs">
+    <div class="tab active" data-tab="file">Torrent File</div>
+    <div class="tab"       data-tab="magnet">Magnet Link</div>
+  </div>
+
+  <div class="tab-panel active" id="panel-file">
+    <input type="file" id="file-input" accept=".torrent">
+    <div class="file-drop-area" id="drop-area">
+      <div id="drop-text">Drop a <strong>.torrent</strong> file here, or click to browse</div>
+    </div>
+  </div>
+
+  <div class="tab-panel" id="panel-magnet">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:5px">
+      <label for="magnet-url" style="margin:0">Paste magnet link or any text containing one</label>
+      <span id="clean-badge" style="display:none;font-size:11px;font-weight:600;
+        padding:2px 8px;border-radius:99px;background:#238636;color:#fff">✓ Cleaned</span>
+    </div>
+    <input type="text" id="magnet-url"
+      placeholder="magnet:?xt=urn:btih:… (or paste noisy text — we'll extract it)"
+      style="font-family:var(--mono);font-size:12px">
+    <div id="magnet-hint" style="font-size:11px;color:var(--muted);margin-top:5px;min-height:16px"></div>
+  </div>
+
+  <div style="margin-top:14px">
+    <label for="output-dir">Output Directory</label>
+    <div class="dir-row">
+      <input type="text" id="output-dir" placeholder="Select a directory…">
+      <button class="btn btn-secondary btn-sm" id="browse-btn" onclick="browseDir()">Browse…</button>
+    </div>
+    <div id="browse-hint" style="font-size:11px;color:var(--muted);margin-top:4px;min-height:16px"></div>
+  </div>
+
+  <details>
+    <summary>Options</summary>
+    <div class="row">
+      <div>
+        <label for="max-peers">Max Peers</label>
+        <input type="number" id="max-peers" value="50" min="1" max="500">
+      </div>
+      <div>
+        <label for="verbose">Verbosity</label>
+        <select id="verbose" class="verbose-select">
+          <option value="0">0 — Silent (errors only)</option>
+          <option value="1" selected>1 — Normal (5% milestones)</option>
+          <option value="2">2 — Verbose (every piece + peer events)</option>
+          <option value="3">3 — Debug (per-block + all messages)</option>
+        </select>
+      </div>
+    </div>
+  </details>
+
+  <button class="btn btn-primary" id="add-btn">▶&nbsp; Add to Queue</button>
+</div>
+
+<!-- ── Download Queue ─────────────────────────────────────────────────────── -->
+<div id="queue-section" style="display:none">
+  <div class="section-header">
+    Download Queue
+    <span class="q-count" id="q-count">0</span>
+  </div>
+  <div id="queue-list"></div>
+</div>
+
+<!-- ── Log ───────────────────────────────────────────────────────────────── -->
+<div class="card">
+  <div class="card-title">
+    Log
+    <button onclick="clearLog()"
+      style="background:none;border:none;color:var(--muted);font-size:11px;cursor:pointer;font-weight:600;">
+      Clear
+    </button>
+  </div>
+  <div class="log-area" id="log-area"></div>
+</div>
+
+</div><!-- /.layout -->
+
+<div id="toast"></div>
+
+<script>
+// ── State ─────────────────────────────────────────────────────────────────────
+let torrentFile = null;
+let evtSource   = null;
+const downloads = {}; // id → dlSnapshot
+
+// ── SSE (open once, stays open for all downloads) ────────────────────────────
+function openSSE() {
+  if (evtSource) return;
+  evtSource = new EventSource('/api/events');
+
+  evtSource.addEventListener('queue_add', e => {
+    const d = JSON.parse(e.data);
+    downloads[d.id] = d;
+    renderCard(d);
+    syncQueueHeader();
+  });
+
+  evtSource.addEventListener('queue_update', e => {
+    const d = JSON.parse(e.data);
+    Object.assign(downloads[d.id] || (downloads[d.id] = {}), d);
+    renderCard(downloads[d.id]);
+    syncQueueHeader();
+  });
+
+  evtSource.addEventListener('progress', e => {
+    const d = JSON.parse(e.data);
+    if (!downloads[d.id]) return;
+    Object.assign(downloads[d.id], {done: d.done, total: d.total, speed: d.speed, pct: d.pct});
+    // Targeted update — only touch the bar and stats text, no full re-render.
+    const card = document.getElementById('card-' + d.id);
+    if (!card) return;
+    const bar   = card.querySelector('.progress-bar');
+    const stats = card.querySelector('.dl-stats');
+    if (bar)   bar.style.width = d.pct.toFixed(2) + '%';
+    if (stats) stats.textContent =
+      d.pct.toFixed(1) + '%  ·  ' + d.done + '/' + d.total + ' pieces  ·  ↓ ' +
+      d.speed.toFixed(2) + ' MB/s';
+  });
+
+  evtSource.addEventListener('log', e => {
+    const d = JSON.parse(e.data);
+    const name = (downloads[d.id] || {}).name || d.id;
+    appendLog(d.line, null, name);
+  });
+
+  evtSource.addEventListener('done', e => {
+    const d = JSON.parse(e.data);
+    showToast('✓ "' + d.name + '" saved to ' + d.output);
+  });
+
+  evtSource.addEventListener('error_event', e => {
+    const d = JSON.parse(e.data);
+    appendLog('[error] ' + d.message, 'error',
+      (downloads[d.id] || {}).name || d.id);
+  });
+
+  evtSource.addEventListener('cancelled', e => {
+    const d = JSON.parse(e.data);
+    appendLog('[gui] download cancelled', 'error',
+      (downloads[d.id] || {}).name || d.id);
+  });
+
+  evtSource.onerror = () => {
+    // Auto-reconnect is built into EventSource; just note it silently.
+  };
+}
+openSSE();
+
+// ── Tabs ─────────────────────────────────────────────────────────────────────
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById('panel-' + tab.dataset.tab).classList.add('active');
+  });
+});
+
+// ── File drop / browse ───────────────────────────────────────────────────────
+const dropArea  = document.getElementById('drop-area');
+const fileInput = document.getElementById('file-input');
+const dropText  = document.getElementById('drop-text');
+
+dropArea.addEventListener('click',     () => fileInput.click());
+dropArea.addEventListener('dragover',  e  => { e.preventDefault(); dropArea.classList.add('dragover'); });
+dropArea.addEventListener('dragleave', ()  => dropArea.classList.remove('dragover'));
+dropArea.addEventListener('drop', e => {
+  e.preventDefault();
+  dropArea.classList.remove('dragover');
+  const f = e.dataTransfer.files[0];
+  if (f && f.name.endsWith('.torrent')) setFile(f);
+});
+fileInput.addEventListener('change', () => {
+  if (fileInput.files[0]) setFile(fileInput.files[0]);
+});
+
+function setFile(f) {
+  torrentFile = f;
+  dropArea.classList.add('has-file');
+  dropText.innerHTML =
+    '<span class="file-name">📄 ' + escHtml(f.name) + '</span>' +
+    '<br><small style="color:var(--muted)">' + (f.size/1024/1024).toFixed(2) + ' MB</small>';
+}
+
+// ── Magnet auto-clean ────────────────────────────────────────────────────────
+const magnetInput = document.getElementById('magnet-url');
+const cleanBadge  = document.getElementById('clean-badge');
+const magnetHint  = document.getElementById('magnet-hint');
+let cleanTimer = null;
+
+magnetInput.addEventListener('input', () => {
+  cleanBadge.style.display = 'none';
+  magnetHint.textContent   = '';
+  magnetInput.classList.remove('input-error');
+  clearTimeout(cleanTimer);
+  const raw = magnetInput.value;
+  if (!raw.trim()) return;
+  cleanTimer = setTimeout(() => tryCleanMagnet(raw), 400);
+});
+magnetInput.addEventListener('paste', () => {
+  setTimeout(() => tryCleanMagnet(magnetInput.value), 0);
+});
+
+async function tryCleanMagnet(raw) {
+  if (!raw.trim()) return;
+  try {
+    const resp = await fetch('/api/clean-magnet', {
+      method: 'POST', headers: {'Content-Type': 'text/plain'}, body: raw,
+    });
+    const data = await resp.json();
+    if (!data.ok) {
+      magnetHint.textContent = '⚠ ' + data.error;
+      magnetHint.style.color = '#ff7b72';
+      return;
+    }
+    if (data.changed) {
+      magnetInput.value        = data.magnet;
+      cleanBadge.style.display = 'inline-block';
+      cleanBadge.style.animation = 'none';
+      requestAnimationFrame(() => { cleanBadge.style.animation = ''; });
+      magnetHint.textContent   = 'Extracted from pasted text';
+      magnetHint.style.color   = 'var(--muted)';
+    } else {
+      magnetHint.textContent   = '✓ Valid magnet URI';
+      magnetHint.style.color   = '#56d364';
+    }
+  } catch (_) {}
+}
+
+// ── Directory picker ─────────────────────────────────────────────────────────
+async function browseDir() {
+  const btn  = document.getElementById('browse-btn');
+  const hint = document.getElementById('browse-hint');
+  btn.disabled    = true;
+  btn.textContent = 'Browsing…';
+  hint.textContent = '';
+  try {
+    const resp = await fetch('/api/browse-dir');
+    if (resp.ok) {
+      const data = await resp.json();
+      document.getElementById('output-dir').value = data.path;
+      hint.textContent = '';
+    } else if (resp.status === 501) {
+      hint.textContent = 'Install zenity (Linux) for a folder picker, or type the path manually.';
+      hint.style.color = 'var(--muted)';
+    }
+    // 204 = user cancelled — do nothing
+  } catch (_) {}
+  btn.disabled    = false;
+  btn.textContent = 'Browse…';
+}
+
+// ── Add to Queue ─────────────────────────────────────────────────────────────
+document.getElementById('add-btn').addEventListener('click', addToQueue);
+
+async function addToQueue() {
+  const activeTab = document.querySelector('.tab.active').dataset.tab;
+  const outputDir = document.getElementById('output-dir').value.trim();
+
+  if (!outputDir) {
+    showToast('Please specify an output directory.'); return;
+  }
+
+  const fd = new FormData();
+  fd.append('source_type', activeTab);
+  fd.append('output_dir',  outputDir);
+  fd.append('max_peers',   document.getElementById('max-peers').value);
+  fd.append('verbose',     document.getElementById('verbose').value);
+
+  if (activeTab === 'file') {
+    if (!torrentFile) { showToast('Please select a .torrent file first.'); return; }
+    fd.append('torrent_file', torrentFile);
+  } else {
+    const m = magnetInput.value.trim();
+    if (!m.startsWith('magnet:')) { showToast('Please enter a valid magnet link.'); return; }
+    fd.append('magnet_url', m);
+  }
+
+  const btn = document.getElementById('add-btn');
+  btn.disabled    = true;
+  btn.textContent = 'Adding…';
+
+  try {
+    const resp = await fetch('/api/download', { method: 'POST', body: fd });
+    if (!resp.ok) {
+      const txt = await resp.text();
+      showToast('Error: ' + txt.trim());
+    } else {
+      // Reset the form so the user can add the next one immediately.
+      resetForm();
+    }
+  } catch (e) {
+    showToast('Network error: ' + e.message);
+  }
+
+  btn.disabled    = false;
+  btn.textContent = '▶  Add to Queue';
+}
+
+function resetForm() {
+  torrentFile = null;
+  dropArea.classList.remove('has-file');
+  dropText.innerHTML = 'Drop a <strong>.torrent</strong> file here, or click to browse';
+  fileInput.value    = '';
+  magnetInput.value  = '';
+  cleanBadge.style.display = 'none';
+  magnetHint.textContent   = '';
+}
+
+// ── Cancel a specific download ────────────────────────────────────────────────
+function cancelDownload(id) {
+  fetch('/api/cancel?id=' + id, { method: 'POST' });
+}
+
+// ── Queue card rendering ──────────────────────────────────────────────────────
+function renderCard(snap) {
+  let card = document.getElementById('card-' + snap.id);
+  const isNew = !card;
+  if (isNew) {
+    card = document.createElement('div');
+    card.id = 'card-' + snap.id;
+    document.getElementById('queue-list').prepend(card);
+  }
+
+  const pct = snap.pct || 0;
+  const statusInfo = {
+    running:   ['badge-running',   '● Running'],
+    done:      ['badge-done',      '✓ Done'],
+    error:     ['badge-error',     '✗ Error'],
+    cancelled: ['badge-cancelled', '⊘ Cancelled'],
+  }[snap.status] || ['badge-cancelled', snap.status];
+
+  let statsText = '';
+  if (snap.status === 'running') {
+    if (snap.total > 0) {
+      statsText = pct.toFixed(1) + '%  ·  ' + snap.done + '/' + snap.total +
+        ' pieces  ·  ↓ ' + (snap.speed || 0).toFixed(2) + ' MB/s';
+    } else {
+      statsText = 'Connecting to peers…';
+    }
+  } else if (snap.status === 'done') {
+    statsText = '100.0%  ·  ' + snap.total + '/' + snap.total + ' pieces';
+  }
+
+  const cancelBtn = snap.status === 'running'
+    ? '<button class="btn btn-danger btn-sm" onclick="cancelDownload(\'' + snap.id + '\')">■ Cancel</button>'
+    : '';
+
+  const errorLine = snap.error
+    ? '<div class="dl-error">⚠ ' + escHtml(snap.error) + '</div>'
+    : '';
+
+  card.className = 'dl-card status-' + snap.status;
+  card.innerHTML =
+    '<div class="dl-card-top">' +
+      '<div class="dl-name">' + escHtml(snap.name || snap.id) + '</div>' +
+      '<span class="dl-badge ' + statusInfo[0] + '">' + statusInfo[1] + '</span>' +
+    '</div>' +
+    '<div class="progress-track"><div class="progress-bar" style="width:' + pct.toFixed(2) + '%"></div></div>' +
+    '<div class="dl-stats">' + escHtml(statsText) + '</div>' +
+    errorLine +
+    '<div class="dl-footer">' +
+      '<span class="dl-output" title="' + escHtml(snap.output_dir) + '">' + escHtml(snap.output_dir) + '</span>' +
+      cancelBtn +
+    '</div>';
+}
+
+function syncQueueHeader() {
+  const count   = Object.keys(downloads).length;
+  const section = document.getElementById('queue-section');
+  section.style.display = count > 0 ? 'block' : 'none';
+  document.getElementById('q-count').textContent = String(count);
+}
+
+// ── Log ───────────────────────────────────────────────────────────────────────
+function appendLog(line, cls, prefix) {
+  const area = document.getElementById('log-area');
+  const div  = document.createElement('div');
+  const effectiveCls = cls || classForLine(line);
+  div.className = 'log-line' + (effectiveCls ? ' ' + effectiveCls : '');
+  if (prefix) {
+    const pfx = document.createElement('span');
+    pfx.className   = 'log-prefix';
+    pfx.textContent = '[' + prefix.slice(0, 20) + ']';
+    div.appendChild(pfx);
+  }
+  div.appendChild(document.createTextNode(line));
+  area.appendChild(div);
+  area.scrollTop = area.scrollHeight;
+}
+
+function classForLine(line) {
+  if (line.startsWith('[engine]'))   return 'engine';
+  if (line.startsWith('[progress]')) return 'progress';
+  if (line.startsWith('[error]'))    return 'error';
+  return '';
+}
+
+function clearLog() {
+  document.getElementById('log-area').innerHTML = '';
+}
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+let toastTimer = null;
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 3500);
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function escHtml(s) {
+  return String(s || '')
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+</script>
+</body>
+</html>

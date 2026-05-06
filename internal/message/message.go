@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sync"
 )
 
 // MessageID is the single-byte type identifier in the BitTorrent protocol.
@@ -22,17 +23,49 @@ const (
 	MsgExtended      MessageID = 20 // BEP 10 extension protocol
 )
 
+// maxPooledBody is the largest message body recycled by bodyPool.
+// Sized for one full block: 1 ID + 8 piece-header + 16384 data = 16393 bytes.
+const maxPooledBody = 16393
+
+// bodyPool recycles message body buffers for the common case of block messages.
+// Larger messages (e.g. large bitfields) fall through to normal allocation.
+var bodyPool = sync.Pool{New: func() any { b := make([]byte, maxPooledBody); return &b }}
+
 // Message is a length-prefixed BitTorrent protocol message.
+// When the message was read via Read(), its Payload is backed by a pooled buffer.
+// Callers MUST call Release() once the payload has been fully consumed so the
+// buffer can be reused. Callers that need to retain the payload past Release()
+// must first call CopyPayload().
 type Message struct {
 	ID      MessageID
-	Payload []byte
+	Payload []byte  // slice into raw; valid until Release()
+	raw     *[]byte // non-nil when backed by bodyPool
+}
+
+// Release returns the backing buffer to the pool.
+// Safe to call on a nil *Message. Must be called exactly once per pooled message.
+func (m *Message) Release() {
+	if m != nil && m.raw != nil {
+		bodyPool.Put(m.raw)
+		m.raw = nil
+	}
+}
+
+// CopyPayload returns an independent copy of Payload that outlives Release().
+func (m *Message) CopyPayload() []byte {
+	if m == nil {
+		return nil
+	}
+	cp := make([]byte, len(m.Payload))
+	copy(cp, m.Payload)
+	return cp
 }
 
 // Serialize encodes the message to the BitTorrent wire format.
-// A nil Message serializes as a keep-alive (length 0, no ID or payload).
+// A nil Message serializes as a keep-alive (4-byte zero length).
 func (m *Message) Serialize() []byte {
 	if m == nil {
-		return make([]byte, 4) // keep-alive
+		return make([]byte, 4)
 	}
 	length := uint32(1 + len(m.Payload))
 	buf := make([]byte, 4+length)
@@ -43,25 +76,39 @@ func (m *Message) Serialize() []byte {
 }
 
 // Read reads one length-prefixed message from r.
-// Returns nil for keep-alive messages.
+// The returned payload is valid until msg.Release() is called.
+// Returns (nil, nil) for keep-alive messages, which require no Release.
 func Read(r io.Reader) (*Message, error) {
-	lengthBuf := make([]byte, 4)
-	if _, err := io.ReadFull(r, lengthBuf); err != nil {
+	var hdr [4]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, fmt.Errorf("read message length: %w", err)
 	}
-	length := binary.BigEndian.Uint32(lengthBuf)
+	length := binary.BigEndian.Uint32(hdr[:])
 	if length == 0 {
 		return nil, nil // keep-alive
 	}
 
-	msgBuf := make([]byte, length)
-	if _, err := io.ReadFull(r, msgBuf); err != nil {
+	if int(length) <= maxPooledBody {
+		// Fast path: borrow a pooled body buffer.
+		rawPtr := bodyPool.Get().(*[]byte)
+		raw := (*rawPtr)[:length]
+		if _, err := io.ReadFull(r, raw); err != nil {
+			bodyPool.Put(rawPtr)
+			return nil, fmt.Errorf("read message body: %w", err)
+		}
+		return &Message{
+			ID:      MessageID(raw[0]),
+			Payload: raw[1:],
+			raw:     rawPtr,
+		}, nil
+	}
+
+	// Large message (oversized bitfield, etc.) — allocate normally; Release is no-op.
+	raw := make([]byte, length)
+	if _, err := io.ReadFull(r, raw); err != nil {
 		return nil, fmt.Errorf("read message body: %w", err)
 	}
-	return &Message{
-		ID:      MessageID(msgBuf[0]),
-		Payload: msgBuf[1:],
-	}, nil
+	return &Message{ID: MessageID(raw[0]), Payload: raw[1:]}, nil
 }
 
 // FormatRequest creates a REQUEST message for a block within a piece.
@@ -116,7 +163,6 @@ func ParseHave(msg *Message) (int, error) {
 }
 
 // FormatExtended creates a BEP 10 extension protocol message.
-// extID 0 = extension handshake; other IDs are assigned during handshake.
 func FormatExtended(extID byte, payload []byte) *Message {
 	buf := make([]byte, 1+len(payload))
 	buf[0] = extID

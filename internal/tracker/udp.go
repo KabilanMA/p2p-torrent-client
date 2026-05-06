@@ -73,7 +73,12 @@ func (t *UDPTracker) GetPeers(infoHash [20]byte, peerID [20]byte, port uint16, l
 		return nil, fmt.Errorf("UDP announce read: %w", err)
 	}
 
-	return parseAnnounceResponse(announceResp[:n], txID)
+	isIPv6 := false
+	if udpAddr, ok := conn.RemoteAddr().(*net.UDPAddr); ok {
+		isIPv6 = udpAddr.IP.To4() == nil
+	}
+
+	return parseAnnounceResponse(announceResp[:n], txID, isIPv6)
 }
 
 func buildConnectRequest(txID uint32) []byte {
@@ -117,7 +122,7 @@ func buildAnnounceRequest(connID uint64, txID uint32, infoHash, peerID [20]byte,
 	return buf.Bytes()
 }
 
-func parseAnnounceResponse(resp []byte, txID uint32) ([]peers.Peer, error) {
+func parseAnnounceResponse(resp []byte, txID uint32, isIPv6 bool) ([]peers.Peer, error) {
 	if len(resp) < 20 {
 		return nil, fmt.Errorf("short announce response: %d bytes", len(resp))
 	}
@@ -130,5 +135,8 @@ func parseAnnounceResponse(resp []byte, txID uint32) ([]peers.Peer, error) {
 		return nil, fmt.Errorf("transaction ID mismatch in announce response")
 	}
 	// bytes 8-12: interval, 12-16: leechers, 16-20: seeders
+	if isIPv6 {
+		return peers.UnmarshalIPv6(resp[20:])
+	}
 	return peers.Unmarshal(resp[20:])
 }

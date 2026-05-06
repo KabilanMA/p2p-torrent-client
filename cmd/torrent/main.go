@@ -17,12 +17,19 @@ import (
 )
 
 func main() {
-	log.SetFlags(log.Ltime | log.Lmicroseconds)
-
 	output := flag.String("o", "", "Output file (single-file) or directory (multi-file) — required")
 	maxPeers := flag.Int("peers", 50, "Maximum concurrent peer connections")
+	verbose := flag.Int("verbose", 0, "Verbosity level:\n"+
+		"\t0  silent  — only fatal errors (default)\n"+
+		"\t1  normal  — banner, peer count, progress every 5%, summary\n"+
+		"\t2  verbose — per-tracker results, every piece, peer connect/disconnect\n"+
+		"\t3  debug   — per-block requests, all peer messages, DHT details")
 	flag.Usage = usage
 	flag.Parse()
+
+	// Route log output based on verbosity so the standard logger
+	// used for fatal errors still works at all levels.
+	log.SetFlags(0)
 
 	if flag.NArg() < 1 {
 		fmt.Fprintln(os.Stderr, "error: missing <torrent-file|magnet-link> argument")
@@ -44,12 +51,12 @@ func main() {
 
 	// Magnet links arrive without piece hashes; fetch metadata from peers first.
 	if !info.HasMetadata() {
-		log.Println("[main] fetching metadata from peers (magnet link)...")
+		logv(*verbose, 1, "fetching metadata from peers (magnet link)...")
 		peerID, err := newPeerID()
 		if err != nil {
 			log.Fatalf("generate peer ID: %v", err)
 		}
-		peerList, err := gatherPeers(info, peerID)
+		peerList, err := gatherPeers(info, peerID, *verbose)
 		if err != nil {
 			log.Fatalf("gather peers for metadata: %v", err)
 		}
@@ -57,13 +64,14 @@ func main() {
 		if err != nil {
 			log.Fatalf("fetch metadata: %v", err)
 		}
-		log.Printf("[main] metadata ok: %q  pieces: %d", info.Name, len(info.PieceHashes))
+		logv(*verbose, 1, "metadata ok: %q  pieces: %d", info.Name, len(info.PieceHashes))
 	}
 
 	engine := &p2p.Engine{
 		Info:     info,
 		Output:   *output,
 		MaxPeers: *maxPeers,
+		Verbose:  *verbose,
 	}
 
 	if err := engine.Download(); err != nil {
@@ -71,6 +79,13 @@ func main() {
 	}
 
 	fmt.Printf("Downloaded %q → %s\n", info.Name, *output)
+}
+
+// logv emits a formatted message only when the current verbosity >= required level.
+func logv(current, required int, format string, args ...interface{}) {
+	if current >= required {
+		fmt.Fprintf(os.Stderr, format+"\n", args...)
+	}
 }
 
 func loadTorrent(input string) (*torrent.TorrentInfo, error) {
@@ -81,7 +96,7 @@ func loadTorrent(input string) (*torrent.TorrentInfo, error) {
 }
 
 // gatherPeers contacts all trackers in the torrent concurrently.
-func gatherPeers(info *torrent.TorrentInfo, peerID [20]byte) ([]peers.Peer, error) {
+func gatherPeers(info *torrent.TorrentInfo, peerID [20]byte, verbose int) ([]peers.Peer, error) {
 	var (
 		mu   sync.Mutex
 		seen = make(map[string]bool)
@@ -100,8 +115,10 @@ func gatherPeers(info *torrent.TorrentInfo, peerID [20]byte) ([]peers.Peer, erro
 			}
 			got, err := t.GetPeers(info.InfoHash, peerID, 6881, info.TotalLength())
 			if err != nil {
+				logv(verbose, 2, "[tracker] %s error: %v", url, err)
 				return
 			}
+			logv(verbose, 2, "[tracker] %s → %d peer(s)", url, len(got))
 			mu.Lock()
 			for _, p := range got {
 				if k := p.String(); !seen[k] {
@@ -156,6 +173,8 @@ Options:
 	fmt.Fprintf(os.Stderr, `
 Examples:
   torrent -o debian.iso debian-12.torrent
-  torrent -o ~/Downloads -peers 100 "magnet:?xt=urn:btih:..."
+  torrent -o debian.iso -verbose 1 debian-12.torrent
+  torrent -o ~/Downloads -peers 100 -verbose 2 "magnet:?xt=urn:btih:..."
+  torrent -o out.iso -verbose 3 ubuntu.torrent     # full debug output
 `)
 }

@@ -21,6 +21,17 @@ var bootstrapNodes = []string{
 	"dht.aelitis.com:6881",
 }
 
+// safeUnmarshal wraps bencode.Unmarshal to catch panics and return them as errors
+func safeUnmarshal(data []byte, v interface{}) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("bencode unmarshal panic: %v", r)
+		}
+	}()
+	err = bencode.Unmarshal(bytes.NewReader(data), v)
+	return
+}
+
 // krpcMsg is the generic KRPC message envelope used by DHT.
 type krpcMsg struct {
 	T string                 `bencode:"t"`
@@ -77,7 +88,7 @@ func GetPeers(infoHash [20]byte, timeout time.Duration) ([]peers.Peer, error) {
 		}
 
 		var resp krpcMsg
-		if err := bencode.Unmarshal(bytes.NewReader(pktBuf[:n]), &resp); err != nil {
+		if err := safeUnmarshal(pktBuf[:n], &resp); err != nil {
 			continue
 		}
 		if resp.Y != "r" || resp.R == nil {

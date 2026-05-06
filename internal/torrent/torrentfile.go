@@ -2,8 +2,10 @@ package torrent
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/sha1"
 	"fmt"
+	"io"
 	"os"
 
 	bencode "github.com/jackpal/bencode-go"
@@ -30,6 +32,7 @@ type bencodeTorrent struct {
 }
 
 // OpenFile parses a .torrent file and returns a TorrentInfo.
+// Transparently decompresses gzip-wrapped torrent files (magic bytes 0x1f 0x8b).
 func OpenFile(path string) (*TorrentInfo, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -37,18 +40,58 @@ func OpenFile(path string) (*TorrentInfo, error) {
 	}
 	defer f.Close()
 
+	// Peek at the first two bytes to detect gzip magic (0x1f 0x8b).
+	var magic [2]byte
+	if _, err := io.ReadFull(f, magic[:]); err != nil {
+		return nil, fmt.Errorf("read torrent file: %w", err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("seek torrent file: %w", err)
+	}
+
+	var r io.Reader = f
+	if magic[0] == 0x1f && magic[1] == 0x8b {
+		gz, err := gzip.NewReader(f)
+		if err != nil {
+			return nil, fmt.Errorf("decompress torrent file: %w", err)
+		}
+		defer gz.Close()
+		r = gz
+	}
+
+	raw, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("read torrent data: %w", err)
+	}
+
 	var bt bencodeTorrent
-	if err := bencode.Unmarshal(f, &bt); err != nil {
+	if err := bencode.Unmarshal(bytes.NewReader(raw), &bt); err != nil {
 		return nil, fmt.Errorf("parse torrent file: %w", err)
 	}
-	return bt.toTorrentInfo()
+
+	// Re-encode from map[string]interface{} to preserve all fields in the info dict
+	m, err := bencode.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return nil, fmt.Errorf("decode torrent file: %w", err)
+	}
+	dict, ok := m.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("torrent is not a dictionary")
+	}
+	info, ok := dict["info"]
+	if !ok {
+		return nil, fmt.Errorf("torrent missing info dictionary")
+	}
+	var buf bytes.Buffer
+	if err := bencode.Marshal(&buf, info); err != nil {
+		return nil, fmt.Errorf("hash info dict: %w", err)
+	}
+	infoHash := sha1.Sum(buf.Bytes())
+
+	return bt.toTorrentInfo(infoHash)
 }
 
-func (bt *bencodeTorrent) toTorrentInfo() (*TorrentInfo, error) {
-	infoHash, err := bt.infoHash()
-	if err != nil {
-		return nil, err
-	}
+func (bt *bencodeTorrent) toTorrentInfo(infoHash [20]byte) (*TorrentInfo, error) {
 	pieceHashes, err := splitPieceHashes(bt.Info.Pieces)
 	if err != nil {
 		return nil, err
@@ -75,14 +118,6 @@ func (bt *bencodeTorrent) toTorrentInfo() (*TorrentInfo, error) {
 	}
 
 	return info, nil
-}
-
-func (bt *bencodeTorrent) infoHash() ([20]byte, error) {
-	var buf bytes.Buffer
-	if err := bencode.Marshal(&buf, bt.Info); err != nil {
-		return [20]byte{}, fmt.Errorf("hash info dict: %w", err)
-	}
-	return sha1.Sum(buf.Bytes()), nil
 }
 
 func splitPieceHashes(pieces string) ([][20]byte, error) {

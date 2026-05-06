@@ -1,7 +1,10 @@
 package tracker
 
 import (
+	"bytes"
+	"compress/gzip"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -37,6 +40,7 @@ func (t *HTTPTracker) GetPeers(infoHash [20]byte, peerID [20]byte, port uint16, 
 	params.Set("compact", "1")
 	params.Set("left", strconv.Itoa(left))
 	params.Set("event", "started")
+	params.Set("key", fmt.Sprintf("%08x", time.Now().UnixNano()))
 	base.RawQuery = params.Encode()
 
 	client := &http.Client{Timeout: 15 * time.Second}
@@ -46,8 +50,24 @@ func (t *HTTPTracker) GetPeers(infoHash [20]byte, peerID [20]byte, port uint16, 
 	}
 	defer resp.Body.Close()
 
+	// Some trackers gzip the body without setting Content-Encoding, so Go's
+	// transparent decompression doesn't fire. Detect via magic bytes.
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read tracker response: %w", err)
+	}
+	var reader io.Reader = bytes.NewReader(body)
+	if len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b {
+		gz, err := gzip.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("decompress tracker response: %w", err)
+		}
+		defer gz.Close()
+		reader = gz
+	}
+
 	var tr bencodeTrackerResp
-	if err := bencode.Unmarshal(resp.Body, &tr); err != nil {
+	if err := bencode.Unmarshal(reader, &tr); err != nil {
 		return nil, fmt.Errorf("decode tracker response: %w", err)
 	}
 	if tr.FailureReason != "" {
