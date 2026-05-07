@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	htmlpkg "html"
 	"io"
 	"log"
 	"net"
@@ -18,10 +19,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/KabilanMA/p2p-torrent-client/internal/metadata"
 	"github.com/KabilanMA/p2p-torrent-client/internal/p2p"
@@ -32,6 +35,20 @@ import (
 
 //go:embed ui/index.html
 var uiFS embed.FS
+
+var (
+	anchorMagnetRe = regexp.MustCompile(`(?is)<a[^>]*href\s*=\s*["']?(magnet:[^"'\s>]+)["']?[^>]*>(.*?)</a>`)
+	anyMagnetRe    = regexp.MustCompile(`(?i)magnet:\?xt=urn:btih:[a-zA-Z0-9]{32,40}[^\s"'<>]*`)
+	htmlTagRe      = regexp.MustCompile(`<[^>]+>`)
+	whitespaceRe   = regexp.MustCompile(`\s+`)
+	// Matches a regular (non-magnet) anchor whose text is a single clean string.
+	titleAnchorRe  = regexp.MustCompile(`(?i)<a\s[^>]*href\s*=\s*["']([^"'#][^"']*)["'][^>]*>([^<]{4,200})</a>`)
+)
+
+type magnetResult struct {
+	Magnet string `json:"magnet"`
+	Name   string `json:"name"`
+}
 
 // sseClient is a channel through which a single SSE connection receives messages.
 type sseClient chan string
@@ -121,9 +138,32 @@ func (d *dlEntry) snapshot() dlSnapshot {
 
 // server holds all state shared across HTTP handlers.
 type server struct {
-	hub       *hub
-	mu        sync.Mutex
-	downloads map[string]*dlEntry
+	hub          *hub
+	mu           sync.Mutex
+	downloads    map[string]*dlEntry
+	resolvedMu   sync.Mutex
+	resolvedMeta map[string]*torrent.TorrentInfo // keyed by lowercase hex info hash
+}
+
+// resolvedInfo is the JSON response for a successfully resolved magnet.
+type resolvedInfo struct {
+	Hash      string `json:"hash"`
+	Name      string `json:"name"`
+	TotalSize int64  `json:"total_size"`
+	FileCount int    `json:"file_count"`
+}
+
+func toResolvedInfo(info *torrent.TorrentInfo) resolvedInfo {
+	fileCount := len(info.Files)
+	if fileCount == 0 && info.Length > 0 {
+		fileCount = 1
+	}
+	return resolvedInfo{
+		Hash:      strings.ToLower(hex.EncodeToString(info.InfoHash[:])),
+		Name:      info.Name,
+		TotalSize: int64(info.TotalLength()),
+		FileCount: fileCount,
+	}
 }
 
 func main() {
@@ -133,18 +173,22 @@ func main() {
 	}
 
 	srv := &server{
-		hub:       newHub(),
-		downloads: make(map[string]*dlEntry),
+		hub:          newHub(),
+		downloads:    make(map[string]*dlEntry),
+		resolvedMeta: make(map[string]*torrent.TorrentInfo),
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/",                 srv.serveIndex)
-	mux.HandleFunc("/api/browse-dir",   srv.handleBrowseDir)
-	mux.HandleFunc("/api/clean-magnet", srv.handleCleanMagnet)
-	mux.HandleFunc("/api/download",     srv.handleDownload)
-	mux.HandleFunc("/api/downloads",    srv.handleDownloads)
-	mux.HandleFunc("/api/cancel",       srv.handleCancel)
-	mux.HandleFunc("/api/events",       srv.handleEvents)
+	mux.HandleFunc("/",                    srv.serveIndex)
+	mux.HandleFunc("/api/browse-dir",      srv.handleBrowseDir)
+	mux.HandleFunc("/api/clean-magnet",    srv.handleCleanMagnet)
+	mux.HandleFunc("/api/scrape-url",      srv.handleScrapeURL)
+	mux.HandleFunc("/api/resolve-magnet",  srv.handleResolveMagnet)
+	mux.HandleFunc("/api/discard-metadata",srv.handleDiscardMeta)
+	mux.HandleFunc("/api/download",        srv.handleDownload)
+	mux.HandleFunc("/api/downloads",       srv.handleDownloads)
+	mux.HandleFunc("/api/cancel",          srv.handleCancel)
+	mux.HandleFunc("/api/events",          srv.handleEvents)
 
 	addr := fmt.Sprintf("http://%s", ln.Addr())
 	fmt.Printf("Torrent GUI → %s\n", addr)
@@ -211,6 +255,273 @@ func (s *server) handleCleanMagnet(w http.ResponseWriter, r *http.Request) {
 		"magnet":  cleaned,
 		"changed": cleaned != raw,
 	})
+}
+
+// handleScrapeURL fetches the given URL and returns all magnet links found on the page.
+func (s *server) handleScrapeURL(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
+	rawURL := strings.TrimSpace(string(body))
+
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		http.Error(w, "invalid URL: must start with http:// or https://", http.StatusBadRequest)
+		return
+	}
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	req, _ := http.NewRequest("GET", rawURL, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; TorrentClient/1.0)")
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, "fetch failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	pageBytes, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+	if err != nil {
+		http.Error(w, "read failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	results := extractMagnetsFromHTML(string(pageBytes))
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(results)
+}
+
+// genericTexts are strings that carry no useful torrent name — filtered from
+// both anchor text and dn= parameter values.
+var genericTexts = map[string]bool{
+	"magnet": true, "magnet link": true, "[magnet]": true, "(magnet)": true,
+	"download": true, "download torrent": true, "torrent": true,
+	"get": true, "get torrent": true, "here": true, "link": true,
+	"click here": true, "click": true, "dl": true, ".torrent": true,
+	"[download]": true, "leechers": true, "seeders": true,
+}
+
+// isGeneric reports whether a candidate name is useless as a display name.
+func isGeneric(s string) bool {
+	lower := strings.ToLower(strings.TrimSpace(s))
+	return lower == "" || len(lower) <= 3 || genericTexts[lower] ||
+		strings.HasPrefix(lower, "magnet-") || strings.HasPrefix(lower, "magnet link")
+}
+
+// chooseName returns the best static name for a magnet from anchor text and
+// the dn= URI parameter. Returns "" when neither is useful (caller should try
+// findRowTitle and then shortHashName as fallbacks).
+func chooseName(anchorText, cleaned string) string {
+	dnName := magnetDisplayName(cleaned)
+	if isGeneric(dnName) {
+		dnName = ""
+	}
+
+	if isGeneric(anchorText) {
+		return dnName // may be ""
+	}
+	// Both anchor and dn= are non-generic: prefer the longer one.
+	if dnName != "" && len(dnName) > len(anchorText)+8 {
+		return dnName
+	}
+	return anchorText
+}
+
+// findRowTitle looks backwards from pos in pageHTML, finds the nearest <tr>
+// or <li> boundary, and returns the longest non-generic anchor text within
+// that row — typically the torrent title link on listing pages.
+func findRowTitle(pageHTML string, pos int) string {
+	const lookback = 3000
+	start := pos - lookback
+	if start < 0 {
+		start = 0
+	}
+	window := pageHTML[start:pos]
+
+	// Find the start of the nearest enclosing row / list-item.
+	rowStart := 0
+	for _, tag := range []string{"<tr", "<TR", "<li ", "<li\t", "<li>", "<LI "} {
+		if i := strings.LastIndex(window, tag); i > rowStart {
+			rowStart = i
+		}
+	}
+	row := window[rowStart:]
+
+	var best string
+	for _, m := range titleAnchorRe.FindAllStringSubmatch(row, -1) {
+		href := m[1]
+		text := strings.TrimSpace(htmlpkg.UnescapeString(m[2]))
+		if strings.HasPrefix(strings.ToLower(href), "magnet:") || isGeneric(text) {
+			continue
+		}
+		if len(text) > len(best) {
+			best = text
+		}
+	}
+	return best
+}
+
+// shortHashName returns the first 12 hex chars of the info hash as a
+// placeholder name (e.g. "23bbca2351ef…"). Used only when everything else fails.
+func shortHashName(cleaned string) string {
+	if i := strings.Index(cleaned, "btih:"); i >= 0 {
+		h := cleaned[i+5:]
+		if j := strings.IndexAny(h, "&? "); j >= 0 {
+			h = h[:j]
+		}
+		h = strings.ToLower(h)
+		if len(h) > 12 {
+			return h[:12] + "…"
+		}
+		return h
+	}
+	return "unknown"
+}
+
+func extractMagnetsFromHTML(pageHTML string) []magnetResult {
+	const maxResults = 100
+	seen := make(map[string]bool)
+	var results []magnetResult
+
+	addMagnet := func(raw, name string) {
+		if len(results) >= maxResults {
+			return
+		}
+		cleaned, err := torrent.ExtractMagnet(htmlpkg.UnescapeString(raw))
+		if err != nil || seen[cleaned] {
+			return
+		}
+		seen[cleaned] = true
+		if name == "" {
+			name = shortHashName(cleaned)
+		}
+		results = append(results, magnetResult{Magnet: cleaned, Name: name})
+	}
+
+	// Pass 1: anchor tags — use position so findRowTitle can look at surrounding HTML.
+	for _, idx := range anchorMagnetRe.FindAllStringSubmatchIndex(pageHTML, -1) {
+		rawMagnet := pageHTML[idx[2]:idx[3]]
+		anchorContent := pageHTML[idx[4]:idx[5]]
+
+		cleaned, err := torrent.ExtractMagnet(htmlpkg.UnescapeString(rawMagnet))
+		if err != nil || seen[cleaned] {
+			continue
+		}
+		seen[cleaned] = true
+
+		anchorText := strings.TrimSpace(whitespaceRe.ReplaceAllString(
+			htmlpkg.UnescapeString(htmlTagRe.ReplaceAllString(anchorContent, " ")), " "))
+
+		name := chooseName(anchorText, cleaned)
+		if name == "" {
+			name = findRowTitle(pageHTML, idx[0])
+		}
+		if name == "" {
+			name = shortHashName(cleaned)
+		}
+
+		if len(results) < maxResults {
+			results = append(results, magnetResult{Magnet: cleaned, Name: name})
+		}
+	}
+
+	// Pass 2: any remaining magnet links not in anchor tags.
+	for _, matchIdx := range anyMagnetRe.FindAllStringIndex(pageHTML, -1) {
+		raw := pageHTML[matchIdx[0]:matchIdx[1]]
+		cleaned, err := torrent.ExtractMagnet(raw)
+		if err != nil || seen[cleaned] {
+			continue
+		}
+		name := findRowTitle(pageHTML, matchIdx[0])
+		addMagnet(raw, name) // addMagnet marks seen and uses shortHashName if name=""
+	}
+
+	if results == nil {
+		results = []magnetResult{}
+	}
+	return results
+}
+
+// handleResolveMagnet fetches BEP 9 metadata for a magnet URI, caches the full
+// TorrentInfo by info hash, and returns name/size so the UI can show real names
+// before the user starts a download.
+func (s *server) handleResolveMagnet(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 16*1024))
+	magnetURI := strings.TrimSpace(string(body))
+
+	info, err := torrent.ParseMagnet(magnetURI)
+	if err != nil {
+		http.Error(w, "invalid magnet: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	hashKey := strings.ToLower(hex.EncodeToString(info.InfoHash[:]))
+
+	// Return immediately if already cached.
+	s.resolvedMu.Lock()
+	if cached, ok := s.resolvedMeta[hashKey]; ok {
+		s.resolvedMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(toResolvedInfo(cached))
+		return
+	}
+	s.resolvedMu.Unlock()
+
+	peerID, err := newPeerID()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	type result struct {
+		info *torrent.TorrentInfo
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		peerList, err := gatherPeers(info, peerID)
+		if err != nil {
+			ch <- result{nil, err}
+			return
+		}
+		resolved, err := metadata.FetchFromPeers(info, peerList, peerID)
+		ch <- result{resolved, err}
+	}()
+
+	select {
+	case res := <-ch:
+		if res.err != nil {
+			http.Error(w, res.err.Error(), http.StatusBadGateway)
+			return
+		}
+		s.resolvedMu.Lock()
+		s.resolvedMeta[hashKey] = res.info
+		s.resolvedMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(toResolvedInfo(res.info))
+	case <-time.After(35 * time.Second):
+		http.Error(w, "metadata fetch timed out", http.StatusGatewayTimeout)
+	}
+}
+
+// handleDiscardMeta removes pre-resolved metadata for a given info hash,
+// freeing memory for magnets the user chose not to download.
+func (s *server) handleDiscardMeta(w http.ResponseWriter, r *http.Request) {
+	hash := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("hash")))
+	if hash == "" {
+		http.Error(w, "hash required", http.StatusBadRequest)
+		return
+	}
+	s.resolvedMu.Lock()
+	delete(s.resolvedMeta, hash)
+	s.resolvedMu.Unlock()
+	w.WriteHeader(http.StatusOK)
 }
 
 // handleDownloads returns the current snapshot of every tracked download.
@@ -393,6 +704,14 @@ func (s *server) runDownload(ctx context.Context, dl *dlEntry, source string, ma
 		s.hub.send("error_event", map[string]string{"id": dl.id, "message": msg})
 	}
 
+	markCancelled := func() {
+		dl.mu.Lock()
+		dl.status = "cancelled"
+		dl.mu.Unlock()
+		s.hub.send("queue_update", dl.snapshot())
+		s.hub.send("cancelled", map[string]string{"id": dl.id})
+	}
+
 	if err := os.MkdirAll(dl.outputDir, 0755); err != nil {
 		setErr("cannot create output directory: " + err.Error())
 		return
@@ -418,27 +737,84 @@ func (s *server) runDownload(ctx context.Context, dl *dlEntry, source string, ma
 	}
 
 	if !info.HasMetadata() {
-		sendLog("[gui] magnet link — fetching metadata from peers…")
-		peerID, err := newPeerID()
-		if err != nil {
-			setErr(err.Error())
-			return
+		hashKey := strings.ToLower(hex.EncodeToString(info.InfoHash[:]))
+
+		// Use pre-resolved metadata from the URL-scrape flow if available.
+		s.resolvedMu.Lock()
+		cached, hasCached := s.resolvedMeta[hashKey]
+		if hasCached {
+			delete(s.resolvedMeta, hashKey) // consume — no longer needed in cache
 		}
-		peerList, err := gatherPeers(info, peerID)
-		if err != nil {
-			setErr("no peers found: " + err.Error())
-			return
+		s.resolvedMu.Unlock()
+
+		if hasCached {
+			info = cached
+			dl.mu.Lock()
+			dl.name = info.Name
+			dl.mu.Unlock()
+			s.hub.send("queue_update", dl.snapshot())
+			sendLog(fmt.Sprintf("[gui] metadata ready (pre-resolved): %q  %d pieces", info.Name, len(info.PieceHashes)))
+		} else {
+			sendLog("[gui] magnet link — fetching metadata from peers…")
+			peerID, err := newPeerID()
+			if err != nil {
+				setErr(err.Error())
+				return
+			}
+
+			// gatherPeers and FetchFromPeers block without context support.
+			// Run each in a goroutine and race it against ctx.Done() so cancel works.
+			type peersResult struct {
+				peers []peers.Peer
+				err   error
+			}
+			pCh := make(chan peersResult, 1)
+			go func() {
+				pl, e := gatherPeers(info, peerID)
+				pCh <- peersResult{pl, e}
+			}()
+
+			var peerList []peers.Peer
+			select {
+			case <-ctx.Done():
+				markCancelled()
+				return
+			case res := <-pCh:
+				if res.err != nil {
+					setErr("no peers found: " + res.err.Error())
+					return
+				}
+				peerList = res.peers
+			}
+
+			type metaResult struct {
+				info *torrent.TorrentInfo
+				err  error
+			}
+			mCh := make(chan metaResult, 1)
+			go func() {
+				i, e := metadata.FetchFromPeers(info, peerList, peerID)
+				mCh <- metaResult{i, e}
+			}()
+
+			select {
+			case <-ctx.Done():
+				markCancelled()
+				return
+			case res := <-mCh:
+				if res.err != nil {
+					setErr("metadata fetch failed: " + res.err.Error())
+					return
+				}
+				info = res.info
+			}
+
+			dl.mu.Lock()
+			dl.name = info.Name
+			dl.mu.Unlock()
+			s.hub.send("queue_update", dl.snapshot())
+			sendLog(fmt.Sprintf("[gui] metadata ok: %q  %d pieces", info.Name, len(info.PieceHashes)))
 		}
-		info, err = metadata.FetchFromPeers(info, peerList, peerID)
-		if err != nil {
-			setErr("metadata fetch failed: " + err.Error())
-			return
-		}
-		dl.mu.Lock()
-		dl.name = info.Name
-		dl.mu.Unlock()
-		s.hub.send("queue_update", dl.snapshot())
-		sendLog(fmt.Sprintf("[gui] metadata ok: %q  %d pieces", info.Name, len(info.PieceHashes)))
 	}
 
 	// Engine.Output must be the full file path for single-file torrents and
@@ -476,11 +852,7 @@ func (s *server) runDownload(ctx context.Context, dl *dlEntry, source string, ma
 
 	if err := engine.Download(); err != nil {
 		if ctx.Err() != nil {
-			dl.mu.Lock()
-			dl.status = "cancelled"
-			dl.mu.Unlock()
-			s.hub.send("queue_update", dl.snapshot())
-			s.hub.send("cancelled", map[string]string{"id": dl.id})
+			markCancelled()
 			return
 		}
 		setErr(err.Error())

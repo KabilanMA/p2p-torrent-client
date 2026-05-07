@@ -286,6 +286,26 @@ select option { background: var(--surface); }
 .log-line.progress{ color: #56d364; }
 .log-prefix { color: var(--muted); margin-right: 6px; }
 
+/* ── URL scrape results ── */
+.magnet-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background .1s;
+}
+.magnet-item:hover { background: rgba(255,255,255,.04); }
+.magnet-item input[type=checkbox] { width: 15px; height: 15px; cursor: pointer; flex-shrink: 0; accent-color: var(--accent2); }
+.magnet-item-name { font-size: 13px; font-weight: 600; word-break: break-word; }
+.magnet-item-hash { font-size: 11px; color: var(--muted); font-family: var(--mono); margin-top: 1px; }
+#magnet-list { max-height: 210px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius); padding: 4px; }
+.magnet-item-sub { display: flex; align-items: center; gap: 8px; margin-top: 2px; }
+.magnet-item-hash { font-size: 11px; color: var(--muted); font-family: var(--mono); }
+.magnet-item-status { font-size: 11px; color: var(--accent2); }
+.magnet-item.resolved .magnet-item-status { color: var(--muted); }
+
 /* ── Magnet badges / hints ── */
 @keyframes fadein { from { opacity:0; transform:scale(.85); } to { opacity:1; transform:scale(1); } }
 #clean-badge { animation: fadein .2s ease; }
@@ -327,13 +347,33 @@ select option { background: var(--surface); }
 
   <div class="tabs">
     <div class="tab active" data-tab="file">Torrent File</div>
-    <div class="tab"       data-tab="magnet">Magnet Link</div>
+    <div class="tab"        data-tab="magnet">Magnet Link</div>
+    <div class="tab"        data-tab="url">From URL</div>
   </div>
 
   <div class="tab-panel active" id="panel-file">
     <input type="file" id="file-input" accept=".torrent">
     <div class="file-drop-area" id="drop-area">
       <div id="drop-text">Drop a <strong>.torrent</strong> file here, or click to browse</div>
+    </div>
+  </div>
+
+  <div class="tab-panel" id="panel-url">
+    <label for="scan-url">Paste any page URL that may contain magnet links</label>
+    <div style="display:flex;gap:8px;margin-bottom:8px">
+      <input type="text" id="scan-url" placeholder="https://example.com/torrents" style="flex:1">
+      <button class="btn btn-secondary btn-sm" id="scan-btn" onclick="scanURL()">Scan Page</button>
+    </div>
+    <div id="scan-hint" style="font-size:11px;color:var(--muted);min-height:16px;margin-bottom:6px"></div>
+    <div id="scan-results" style="display:none">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+        <span id="scan-count" style="font-size:12px;color:var(--muted)"></span>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn-secondary btn-sm" onclick="selectAllMagnets(true)">All</button>
+          <button class="btn btn-secondary btn-sm" onclick="selectAllMagnets(false)">None</button>
+        </div>
+      </div>
+      <div id="magnet-list"></div>
     </div>
   </div>
 
@@ -407,9 +447,10 @@ select option { background: var(--surface); }
 
 <script>
 // ── State ─────────────────────────────────────────────────────────────────────
-let torrentFile = null;
-let evtSource   = null;
-const downloads = {}; // id → dlSnapshot
+let torrentFile    = null;
+let evtSource      = null;
+let scannedMagnets = []; // [{magnet, name}, …]
+const downloads    = {}; // id → dlSnapshot
 
 // ── SSE (open once, stays open for all downloads) ────────────────────────────
 function openSSE() {
@@ -555,6 +596,137 @@ async function tryCleanMagnet(raw) {
   } catch (_) {}
 }
 
+// ── URL scraper ───────────────────────────────────────────────────────────────
+async function scanURL() {
+  const rawURL = document.getElementById('scan-url').value.trim();
+  if (!rawURL) { showToast('Please enter a URL.'); return; }
+  if (!rawURL.startsWith('http://') && !rawURL.startsWith('https://')) {
+    showToast('URL must start with http:// or https://'); return;
+  }
+
+  const btn     = document.getElementById('scan-btn');
+  const hint    = document.getElementById('scan-hint');
+  const results = document.getElementById('scan-results');
+
+  btn.disabled    = true;
+  btn.textContent = 'Scanning…';
+  hint.textContent = 'Fetching page…';
+  hint.style.color = 'var(--muted)';
+  results.style.display = 'none';
+
+  try {
+    const resp = await fetch('/api/scrape-url', {
+      method: 'POST', headers: {'Content-Type': 'text/plain'}, body: rawURL,
+    });
+    if (!resp.ok) {
+      hint.textContent = '⚠ ' + (await resp.text()).trim();
+      hint.style.color = '#ff7b72';
+      return;
+    }
+    const magnets = await resp.json();
+    // Enrich each entry with the info hash extracted client-side.
+    scannedMagnets = magnets.map(m => ({
+      ...m,
+      hash: (m.magnet.match(/btih:([a-zA-Z0-9]+)/i) || [])[1]?.toLowerCase() || '',
+    }));
+    if (scannedMagnets.length === 0) {
+      hint.textContent = 'No magnet links found on that page.';
+      hint.style.color = 'var(--muted)';
+      return;
+    }
+    hint.textContent = '';
+    renderMagnetList(scannedMagnets);
+    document.getElementById('scan-count').textContent =
+      scannedMagnets.length + ' magnet link' + (scannedMagnets.length !== 1 ? 's' : '') + ' found';
+    results.style.display = 'block';
+    autoResolveMagnets();
+  } catch (e) {
+    hint.textContent = '⚠ Network error: ' + e.message;
+    hint.style.color = '#ff7b72';
+  } finally {
+    btn.disabled    = false;
+    btn.textContent = 'Scan Page';
+  }
+}
+
+function renderMagnetList(magnets) {
+  document.getElementById('magnet-list').innerHTML = magnets.map((m, i) => {
+    return '<label class="magnet-item" id="ml-' + i + '" for="mi-' + i + '">' +
+      '<input type="checkbox" id="mi-' + i + '" checked>' +
+      '<div style="flex:1;min-width:0">' +
+        '<div class="magnet-item-name">' + escHtml(m.name) + '</div>' +
+        '<div class="magnet-item-sub">' +
+          '<span class="magnet-item-status">⟳ Resolving name…</span>' +
+        '</div>' +
+      '</div>' +
+    '</label>';
+  }).join('');
+}
+
+function selectAllMagnets(state) {
+  document.querySelectorAll('#magnet-list input[type=checkbox]').forEach(cb => { cb.checked = state; });
+}
+
+// ── Background metadata resolution ───────────────────────────────────────────
+async function autoResolveMagnets() {
+  const BATCH = 4; // max concurrent resolve requests
+  const indices = scannedMagnets.map((_, i) => i);
+  for (let i = 0; i < indices.length; i += BATCH) {
+    await Promise.allSettled(indices.slice(i, i + BATCH).map(idx => resolveOne(idx)));
+  }
+}
+
+async function resolveOne(idx) {
+  const m = scannedMagnets[idx];
+  if (!m) return;
+  try {
+    const resp = await fetch('/api/resolve-magnet', {
+      method: 'POST', headers: {'Content-Type': 'text/plain'}, body: m.magnet,
+    });
+    if (resp.ok) {
+      const info = await resp.json();
+      scannedMagnets[idx].name      = info.name;
+      scannedMagnets[idx].hash      = info.hash;
+      scannedMagnets[idx].totalSize = info.total_size;
+      scannedMagnets[idx].fileCount = info.file_count;
+      updateMagnetItemState(idx, true, info);
+    } else {
+      updateMagnetItemState(idx, false, null);
+    }
+  } catch (_) {
+    updateMagnetItemState(idx, false, null);
+  }
+}
+
+function updateMagnetItemState(idx, resolved, info) {
+  const label = document.getElementById('ml-' + idx);
+  if (!label) return;
+  const nameEl   = label.querySelector('.magnet-item-name');
+  const statusEl = label.querySelector('.magnet-item-status');
+  if (resolved && info) {
+    if (nameEl) nameEl.textContent = info.name;
+    label.classList.add('resolved');
+    const parts = [];
+    if (info.total_size > 0) parts.push(formatBytes(info.total_size));
+    if (info.file_count > 1) parts.push(info.file_count + ' files');
+    if (statusEl) statusEl.textContent = parts.join('  ·  ');
+  } else {
+    // Resolution failed — show the short hash so the user has some identifier.
+    const m = scannedMagnets[idx];
+    const hash = m && m.hash ? m.hash.slice(0, 16) + '…' : '';
+    if (statusEl) statusEl.textContent = hash;
+    if (statusEl) statusEl.style.color = 'var(--muted)';
+  }
+}
+
+function formatBytes(b) {
+  if (b >= 1e12) return (b / 1e12).toFixed(2) + ' TB';
+  if (b >= 1e9)  return (b / 1e9).toFixed(2)  + ' GB';
+  if (b >= 1e6)  return (b / 1e6).toFixed(1)  + ' MB';
+  if (b >= 1e3)  return (b / 1e3).toFixed(0)  + ' KB';
+  return b + ' B';
+}
+
 // ── Directory picker ─────────────────────────────────────────────────────────
 async function browseDir() {
   const btn  = document.getElementById('browse-btn');
@@ -595,27 +767,56 @@ async function addToQueue() {
   fd.append('max_peers',   document.getElementById('max-peers').value);
   fd.append('verbose',     document.getElementById('verbose').value);
 
-  if (activeTab === 'file') {
-    if (!torrentFile) { showToast('Please select a .torrent file first.'); return; }
-    fd.append('torrent_file', torrentFile);
-  } else {
-    const m = magnetInput.value.trim();
-    if (!m.startsWith('magnet:')) { showToast('Please enter a valid magnet link.'); return; }
-    fd.append('magnet_url', m);
-  }
-
   const btn = document.getElementById('add-btn');
   btn.disabled    = true;
   btn.textContent = 'Adding…';
 
   try {
-    const resp = await fetch('/api/download', { method: 'POST', body: fd });
-    if (!resp.ok) {
-      const txt = await resp.text();
-      showToast('Error: ' + txt.trim());
-    } else {
-      // Reset the form so the user can add the next one immediately.
-      resetForm();
+    if (activeTab === 'file') {
+      if (!torrentFile) { showToast('Please select a .torrent file first.'); return; }
+      fd.append('torrent_file', torrentFile);
+      const resp = await fetch('/api/download', { method: 'POST', body: fd });
+      if (!resp.ok) showToast('Error: ' + (await resp.text()).trim());
+      else resetForm();
+
+    } else if (activeTab === 'magnet') {
+      const m = magnetInput.value.trim();
+      if (!m.startsWith('magnet:')) { showToast('Please enter a valid magnet link.'); return; }
+      fd.append('magnet_url', m);
+      const resp = await fetch('/api/download', { method: 'POST', body: fd });
+      if (!resp.ok) showToast('Error: ' + (await resp.text()).trim());
+      else resetForm();
+
+    } else if (activeTab === 'url') {
+      const selectedIdx = new Set();
+      document.querySelectorAll('#magnet-list input[type=checkbox]').forEach((cb, idx) => {
+        if (cb.checked && scannedMagnets[idx]) selectedIdx.add(idx);
+      });
+      if (selectedIdx.size === 0) { showToast('Select at least one magnet link.'); return; }
+
+      // Discard pre-resolved metadata for magnets the user did not select.
+      scannedMagnets.forEach((m, idx) => {
+        if (!selectedIdx.has(idx) && m.hash) {
+          fetch('/api/discard-metadata?hash=' + encodeURIComponent(m.hash), { method: 'POST' });
+        }
+      });
+
+      let added = 0;
+      for (const idx of selectedIdx) {
+        const m = scannedMagnets[idx];
+        const mfd = new FormData();
+        mfd.append('source_type', 'magnet');
+        mfd.append('output_dir',  outputDir);
+        mfd.append('max_peers',   document.getElementById('max-peers').value);
+        mfd.append('verbose',     document.getElementById('verbose').value);
+        mfd.append('magnet_url',  m.magnet);
+        const resp = await fetch('/api/download', { method: 'POST', body: mfd });
+        if (resp.ok) added++;
+      }
+      if (added > 0) {
+        showToast('Added ' + added + ' download' + (added !== 1 ? 's' : '') + ' to queue.');
+        resetForm();
+      }
     }
   } catch (e) {
     showToast('Network error: ' + e.message);
@@ -633,6 +834,10 @@ function resetForm() {
   magnetInput.value  = '';
   cleanBadge.style.display = 'none';
   magnetHint.textContent   = '';
+  document.getElementById('scan-url').value     = '';
+  document.getElementById('scan-hint').textContent = '';
+  document.getElementById('scan-results').style.display = 'none';
+  scannedMagnets = [];
 }
 
 // ── Cancel a specific download ────────────────────────────────────────────────
