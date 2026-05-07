@@ -9,6 +9,12 @@ import (
 	"github.com/KabilanMA/p2p-torrent-client/internal/torrent"
 )
 
+// pieceWriter is satisfied by diskWriter (standard) and uringDiskWriter (Linux io_uring).
+type pieceWriter interface {
+	Submit(index int, buf []byte)
+	Close() error
+}
+
 // diskWriter pre-allocates output files and accepts verified piece buffers on
 // a buffered channel so disk latency never blocks network goroutines.
 // The zero-copy design: each buffer is owned by the writer after Submit and

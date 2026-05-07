@@ -74,6 +74,25 @@ type Engine struct {
 	PProfAddr string
 
 	lg *log.Logger
+
+	// Strategy 2 — UCB1: per-peer throughput stats for adaptive pipeline depth.
+	statsMu       sync.Mutex
+	peerStatMap   map[string]*peerStats
+	totalAssigned int64 // total pieces assigned across all peers (atomic)
+}
+
+func (e *Engine) getOrCreateStats(key string) *peerStats {
+	e.statsMu.Lock()
+	if e.peerStatMap == nil {
+		e.peerStatMap = make(map[string]*peerStats)
+	}
+	ps, ok := e.peerStatMap[key]
+	if !ok {
+		ps = &peerStats{}
+		e.peerStatMap[key] = ps
+	}
+	e.statsMu.Unlock()
+	return ps
 }
 
 // callbackWriter tees log writes to the LogFunc callback.
@@ -160,8 +179,9 @@ func (e *Engine) Download() error {
 	globalPiecePool = newPiecePool(e.Info.PieceLength)
 
 	// Open output files and start the async disk-write goroutine.
-	// Direct WriteAt per piece — no full-torrent RAM buffer.
-	dw, err := newDiskWriter(e.Info, e.Output)
+	// On Linux, newPieceWriter tries io_uring first and falls back to the
+	// standard WriteAt implementation if the kernel doesn't support it.
+	dw, err := newPieceWriter(e.Info, e.Output)
 	if err != nil {
 		return fmt.Errorf("open output: %w", err)
 	}
@@ -412,6 +432,9 @@ func (e *Engine) runWorker(
 		return
 	}
 
+	// Strategy 2 — UCB1: get this peer's stats tracker.
+	ps := e.getOrCreateStats(peer.String())
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -427,13 +450,19 @@ func (e *Engine) runWorker(
 
 		e.logf(3, "[worker] %s claiming piece #%d (%s)", peer, pw.index, humanBytes(pw.length))
 
-		buf, err := e.downloadPiece(c, pw)
+		atomic.AddInt64(&ps.assigned, 1)
+		atomic.AddInt64(&e.totalAssigned, 1)
+		pieceStart := time.Now()
+
+		buf, err := e.downloadPiece(c, pw, ps)
 		if err != nil {
 			// buf is nil on error (downloadPiece returns the buffer to pool itself).
 			e.logf(2, "[worker] %s piece #%d download error: %v — requeueing", peer, pw.index, err)
 			queue.put(pw)
 			return
 		}
+
+		ps.update(pw.length, time.Since(pieceStart))
 
 		// Cap concurrent SHA-1 verification to NumCPU to prevent CPU oversubscription.
 		verifySem <- struct{}{}
@@ -463,11 +492,16 @@ type pieceProgress struct {
 }
 
 // downloadPiece fetches all blocks of pw from peer c with adaptive pipelining.
+// ps, when non-nil, supplies a UCB1-derived pipeline depth for this peer.
 // On error it returns (nil, err) and has already returned the piece buffer to
 // globalPiecePool so the caller never sees a leaked buffer.
-func (e *Engine) downloadPiece(c *client.Client, pw *pieceWork) ([]byte, error) {
+func (e *Engine) downloadPiece(c *client.Client, pw *pieceWork, ps *peerStats) ([]byte, error) {
+	backlogMax := initBacklog
+	if ps != nil {
+		backlogMax = ps.ucbBacklog(atomic.LoadInt64(&e.totalAssigned))
+	}
 	buf := globalPiecePool.get(pw.length)
-	state := &pieceProgress{buf: buf, backlogMax: initBacklog}
+	state := &pieceProgress{buf: buf, backlogMax: backlogMax}
 
 	// Set one deadline for the entire piece download.
 	// ReadMsg() inside the loop does NOT reset it — saves ~64 syscalls per piece.
@@ -571,6 +605,13 @@ func (e *Engine) runEndgame(
 	// Bound endgame concurrency to avoid a connection storm.
 	endgameSem := make(chan struct{}, 4*runtime.NumCPU())
 
+	// sent[i] gates which endgame goroutine sends piece i to results.
+	// We must NOT reuse written[i] for this: written[i] is set to true by the
+	// assembler when it processes a result. If an endgame goroutine sets it
+	// first, the assembler sees it as a duplicate and discards it without
+	// incrementing done — causing an incomplete download.
+	sent := make([]atomic.Bool, len(written))
+
 	var wg sync.WaitGroup
 	for _, pw := range remaining {
 		if written[pw.index].Load() {
@@ -583,7 +624,7 @@ func (e *Engine) runEndgame(
 				defer wg.Done()
 				defer func() { <-endgameSem }()
 
-				// Fast-path exit if another goroutine already finished this piece.
+				// Fast-path: assembler already processed this piece.
 				if written[work.index].Load() {
 					return
 				}
@@ -601,7 +642,7 @@ func (e *Engine) runEndgame(
 				c.SendUnchoke()
 				c.SendInterested()
 
-				buf, err := e.downloadPiece(c, work)
+				buf, err := e.downloadPiece(c, work, nil) // endgame: no UCB1 tracking
 				if err != nil {
 					return // buf already returned to pool by downloadPiece
 				}
@@ -615,9 +656,10 @@ func (e *Engine) runEndgame(
 					return
 				}
 
-				// Atomic CAS: only the first goroutine to finish sends the result.
-				if written[work.index].Swap(true) {
-					globalPiecePool.put(buf) // we lost the race
+				// Deduplicate across concurrent endgame goroutines for this piece.
+				// The assembler remains the sole entity that sets written[i]=true.
+				if sent[work.index].Swap(true) {
+					globalPiecePool.put(buf) // another goroutine beat us
 					return
 				}
 				e.logf(2, "[endgame] piece #%d received from %s", work.index, p)

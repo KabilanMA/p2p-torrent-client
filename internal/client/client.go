@@ -41,6 +41,9 @@ func New(peer peers.Peer, peerID, infoHash [20]byte) (*Client, error) {
 		tc.SetWriteBuffer(512<<10) // 512 KiB — generous budget for REQUEST bursts
 		tc.SetNoDelay(true)        // disable Nagle
 	}
+	// Strategy 1 — BBR: switch to BBR congestion control for higher throughput
+	// and lower latency vs CUBIC on high-BDP paths (Cardwell et al. SIGCOMM 2016).
+	applyBBR(conn)
 
 	hs, err := completeHandshake(conn, infoHash, peerID)
 	if err != nil {
