@@ -29,6 +29,7 @@ import (
 	"github.com/KabilanMA/p2p-torrent-client/internal/metadata"
 	"github.com/KabilanMA/p2p-torrent-client/internal/p2p"
 	"github.com/KabilanMA/p2p-torrent-client/internal/peers"
+	"github.com/KabilanMA/p2p-torrent-client/internal/stream"
 	"github.com/KabilanMA/p2p-torrent-client/internal/torrent"
 	"github.com/KabilanMA/p2p-torrent-client/internal/tracker"
 )
@@ -136,6 +137,23 @@ func (d *dlEntry) snapshot() dlSnapshot {
 	}
 }
 
+// streamEntry holds live state for one streaming session.
+type streamEntry struct {
+	mu      sync.Mutex
+	id      string
+	sess    *stream.Session
+	name    string
+	hasZip  bool // torrent contains archive files that need extraction
+}
+
+// streamFileInfo is the JSON-serialisable view of one playable file.
+type streamFileInfo struct {
+	Idx  int    `json:"idx"`
+	Name string `json:"name"`
+	Ext  string `json:"ext"`
+	Size int64  `json:"size"`
+}
+
 // server holds all state shared across HTTP handlers.
 type server struct {
 	hub          *hub
@@ -143,6 +161,8 @@ type server struct {
 	downloads    map[string]*dlEntry
 	resolvedMu   sync.Mutex
 	resolvedMeta map[string]*torrent.TorrentInfo // keyed by lowercase hex info hash
+	streamMu     sync.Mutex
+	streams      map[string]*streamEntry
 }
 
 // resolvedInfo is the JSON response for a successfully resolved magnet.
@@ -176,6 +196,7 @@ func main() {
 		hub:          newHub(),
 		downloads:    make(map[string]*dlEntry),
 		resolvedMeta: make(map[string]*torrent.TorrentInfo),
+		streams:      make(map[string]*streamEntry),
 	}
 
 	mux := http.NewServeMux()
@@ -189,6 +210,8 @@ func main() {
 	mux.HandleFunc("/api/downloads",       srv.handleDownloads)
 	mux.HandleFunc("/api/cancel",          srv.handleCancel)
 	mux.HandleFunc("/api/events",          srv.handleEvents)
+	mux.HandleFunc("/api/stream",          srv.handleStreamStart)
+	mux.HandleFunc("/api/stream/",         srv.handleStreamDispatch)
 
 	addr := fmt.Sprintf("http://%s", ln.Addr())
 	fmt.Printf("Torrent GUI → %s\n", addr)
@@ -871,6 +894,334 @@ func (s *server) runDownload(ctx context.Context, dl *dlEntry, source string, ma
 		"name":   info.Name,
 		"output": dl.outputDir,
 	})
+}
+
+// ── Stream handlers ───────────────────────────────────────────────────────────
+
+// handleStreamStart resolves torrent metadata, detects playable files, and
+// starts a streaming session. The download runs to a private temp directory
+// so the user's disk stays clean until they choose to save.
+//
+// Response codes:
+//
+//	200 — playable files found; includes file list in JSON
+//	202 — only archive files found; client should wait for stream_ready SSE
+//	422 — no playable files at all; client should offer normal download
+//	4xx/5xx — error
+func (s *server) handleStreamStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		http.Error(w, "bad form: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	sourceType := r.FormValue("source_type")
+	maxPeers, _ := strconv.Atoi(r.FormValue("max_peers"))
+	verbose, _ := strconv.Atoi(r.FormValue("verbose"))
+	if maxPeers < 1 {
+		maxPeers = 50
+	}
+
+	// Resolve torrent info (same flow as handleDownload, but no output_dir).
+	var source string
+	var displayName string
+	switch sourceType {
+	case "file":
+		file, header, err := r.FormFile("torrent_file")
+		if err != nil {
+			http.Error(w, "no torrent file: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		defer file.Close()
+		displayName = strings.TrimSuffix(header.Filename, ".torrent")
+		tmp, err := os.CreateTemp("", "torrent-*.torrent")
+		if err != nil {
+			http.Error(w, "temp file: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if _, err := io.Copy(tmp, file); err != nil {
+			tmp.Close(); os.Remove(tmp.Name())
+			http.Error(w, "write temp: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		tmp.Close()
+		source = tmp.Name()
+		defer os.Remove(source)
+	case "magnet":
+		m := strings.TrimSpace(r.FormValue("magnet_url"))
+		if !strings.HasPrefix(m, "magnet:") {
+			http.Error(w, "invalid magnet URI", http.StatusBadRequest)
+			return
+		}
+		source = m
+		displayName = magnetDisplayName(m)
+	default:
+		http.Error(w, "unknown source_type", http.StatusBadRequest)
+		return
+	}
+
+	var info *torrent.TorrentInfo
+	var err error
+	if strings.HasPrefix(source, "magnet:") {
+		info, err = torrent.ParseMagnet(source)
+	} else {
+		info, err = torrent.OpenFile(source)
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if info.Name != "" {
+		displayName = info.Name
+	}
+
+	// Fetch metadata for magnet links that have none.
+	if !info.HasMetadata() {
+		hashKey := strings.ToLower(hex.EncodeToString(info.InfoHash[:]))
+		s.resolvedMu.Lock()
+		cached, ok := s.resolvedMeta[hashKey]
+		if ok {
+			delete(s.resolvedMeta, hashKey)
+		}
+		s.resolvedMu.Unlock()
+
+		if ok {
+			info = cached
+		} else {
+			peerID, err := newPeerID()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			peerList, err := gatherPeers(info, peerID)
+			if err != nil {
+				http.Error(w, "no peers: "+err.Error(), http.StatusBadGateway)
+				return
+			}
+			resolved, err := metadata.FetchFromPeers(info, peerList, peerID)
+			if err != nil {
+				http.Error(w, "metadata fetch: "+err.Error(), http.StatusBadGateway)
+				return
+			}
+			info = resolved
+		}
+		displayName = info.Name
+	}
+
+	// Detect playable and archive files.
+	videos, archives := stream.ScanFiles(info, "")
+	hasArchiveOnly := len(videos) == 0 && len(archives) > 0
+
+	if len(videos) == 0 && len(archives) == 0 {
+		// Nothing playable — tell the UI to offer a normal download instead.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		json.NewEncoder(w).Encode(map[string]any{
+			"no_playable": true,
+			"name":        displayName,
+		})
+		return
+	}
+
+	// Create session and start download.
+	id := newID()
+	sess, err := stream.NewSession(id, info)
+	if err != nil {
+		http.Error(w, "create session: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Populate physical paths now that tempDir is known.
+	videos, _ = stream.ScanFiles(info, sess.TempDir)
+	sess.SetFiles(videos)
+
+	entry := &streamEntry{id: id, sess: sess, name: displayName, hasZip: hasArchiveOnly}
+	s.streamMu.Lock()
+	s.streams[id] = entry
+	s.streamMu.Unlock()
+
+	sendLog := func(line string) {
+		s.hub.send("stream_log", map[string]string{"id": id, "line": line})
+	}
+	progressFn := func(done, total int, speedMBps float64) {
+		s.hub.send("stream_progress", map[string]any{
+			"id":    id,
+			"done":  done,
+			"total": total,
+			"speed": speedMBps,
+			"pct":   float64(done) / float64(total) * 100,
+		})
+	}
+
+	sess.Start(context.Background(), maxPeers, verbose, sendLog, progressFn, nil)
+
+	// If the torrent contains only archive files, wait for full download
+	// in a background goroutine, then extract and notify via SSE.
+	if hasArchiveOnly {
+		_, archivesWithPaths := stream.ScanFiles(info, sess.TempDir)
+		go s.runArchiveExtraction(id, sess, archivesWithPaths)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]any{
+			"id":          id,
+			"name":        displayName,
+			"has_archive": true,
+			"files":       []streamFileInfo{},
+		})
+		return
+	}
+
+	// Direct video files — respond immediately with file list.
+	fileInfos := toStreamFileInfos(videos)
+	go func() {
+		<-sess.Done()
+		if sess.DownloadErr() != nil {
+			s.hub.send("stream_error", map[string]string{"id": id, "message": sess.DownloadErr().Error()})
+		} else {
+			s.hub.send("stream_done", map[string]string{"id": id})
+		}
+	}()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"id":          id,
+		"name":        displayName,
+		"has_archive": false,
+		"files":       fileInfos,
+	})
+}
+
+// runArchiveExtraction waits for the P2P download to finish, extracts video
+// files from each archive, and notifies the browser via SSE.
+func (s *server) runArchiveExtraction(id string, sess *stream.Session, archives []stream.ArchiveFile) {
+	<-sess.Done()
+	if sess.DownloadErr() != nil {
+		s.hub.send("stream_error", map[string]string{"id": id, "message": sess.DownloadErr().Error()})
+		return
+	}
+
+	var allVideos []stream.PlayableFile
+	for _, arch := range archives {
+		videos, err := sess.ExtractZip(arch)
+		if err != nil {
+			s.hub.send("stream_log", map[string]string{"id": id, "line": "[stream] zip extract error: " + err.Error()})
+			continue
+		}
+		allVideos = append(allVideos, videos...)
+	}
+
+	if len(allVideos) == 0 {
+		s.hub.send("stream_error", map[string]string{"id": id, "message": "no playable files found inside archive"})
+		return
+	}
+
+	sess.SetFiles(allVideos)
+	s.hub.send("stream_ready", map[string]any{
+		"id":    id,
+		"files": toStreamFileInfos(allVideos),
+	})
+}
+
+func toStreamFileInfos(files []stream.PlayableFile) []streamFileInfo {
+	out := make([]streamFileInfo, len(files))
+	for i, f := range files {
+		out[i] = streamFileInfo{
+			Idx:  i,
+			Name: f.Name,
+			Ext:  f.Extension,
+			Size: f.Size,
+		}
+	}
+	return out
+}
+
+// handleStreamDispatch routes sub-paths under /api/stream/{id}/...
+func (s *server) handleStreamDispatch(w http.ResponseWriter, r *http.Request) {
+	// Strip "/api/stream/" prefix.
+	rest := strings.TrimPrefix(r.URL.Path, "/api/stream/")
+	parts := strings.SplitN(rest, "/", 3)
+
+	if len(parts) < 1 || parts[0] == "" {
+		http.NotFound(w, r)
+		return
+	}
+	id := parts[0]
+
+	s.streamMu.Lock()
+	entry, ok := s.streams[id]
+	s.streamMu.Unlock()
+	if !ok {
+		http.Error(w, "stream not found", http.StatusNotFound)
+		return
+	}
+
+	if len(parts) == 1 {
+		// DELETE /api/stream/{id} — close session.
+		if r.Method == http.MethodDelete {
+			entry.sess.Close()
+			s.streamMu.Lock()
+			delete(s.streams, id)
+			s.streamMu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		} else {
+			http.NotFound(w, r)
+		}
+		return
+	}
+
+	switch parts[1] {
+	case "file":
+		// GET /api/stream/{id}/file/{idx}
+		if len(parts) < 3 {
+			http.NotFound(w, r)
+			return
+		}
+		idx, err := strconv.Atoi(parts[2])
+		if err != nil {
+			http.Error(w, "invalid file index", http.StatusBadRequest)
+			return
+		}
+		entry.sess.ServeFile(w, r, idx)
+
+	case "status":
+		// GET /api/stream/{id}/status
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"id":         id,
+			"downloaded": entry.sess.Waiter.Downloaded(),
+			"total":      entry.sess.Waiter.Total(),
+		})
+
+	case "save":
+		// POST /api/stream/{id}/save — copy files to output_dir.
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			OutputDir string `json:"output_dir"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.OutputDir == "" {
+			http.Error(w, "output_dir required", http.StatusBadRequest)
+			return
+		}
+		go func() {
+			if err := entry.sess.Save(body.OutputDir); err != nil {
+				s.hub.send("stream_save_error", map[string]string{"id": id, "message": err.Error()})
+			} else {
+				s.hub.send("stream_saved", map[string]string{"id": id, "output": body.OutputDir})
+			}
+		}()
+		w.WriteHeader(http.StatusAccepted)
+
+	default:
+		http.NotFound(w, r)
+	}
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

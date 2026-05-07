@@ -28,6 +28,7 @@ type diskWriter struct {
 	writeC    chan writeReq
 	doneC     chan error
 	wg        sync.WaitGroup
+	writtenCb func(int) // called after each successful piece write; may be nil
 }
 
 type writeReq struct {
@@ -38,13 +39,16 @@ type writeReq struct {
 // newDiskWriter opens/creates and pre-allocates all output files, then starts
 // the background write goroutine. output follows the Engine.Output convention:
 // full file path for single-file torrents, parent directory for multi-file.
-func newDiskWriter(info *torrent.TorrentInfo, output string) (*diskWriter, error) {
+// writtenCb, if non-nil, is called after each piece is successfully written to
+// disk; used by the streaming layer to unblock waiting HTTP range readers.
+func newDiskWriter(info *torrent.TorrentInfo, output string, writtenCb func(int)) (*diskWriter, error) {
 	dw := &diskWriter{
-		info:     info,
-		totalLen: int64(info.TotalLength()),
-		pieceLen: int64(info.PieceLength),
-		writeC:   make(chan writeReq, 256), // deep enough to absorb network bursts
-		doneC:    make(chan error, 1),
+		info:      info,
+		totalLen:  int64(info.TotalLength()),
+		pieceLen:  int64(info.PieceLength),
+		writeC:    make(chan writeReq, 256), // deep enough to absorb network bursts
+		doneC:     make(chan error, 1),
+		writtenCb: writtenCb,
 	}
 
 	if info.IsMultiFile() {
@@ -123,6 +127,8 @@ func (dw *diskWriter) loop() {
 		if writeErr == nil {
 			if err := dw.writePiece(req.index, req.buf); err != nil {
 				writeErr = err
+			} else if dw.writtenCb != nil {
+				dw.writtenCb(req.index)
 			}
 		}
 		// Always return buffer to pool regardless of write errors.

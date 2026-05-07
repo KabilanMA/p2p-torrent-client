@@ -73,6 +73,16 @@ type Engine struct {
 	// (e.g. "127.0.0.1:6060") for profiling active downloads.
 	PProfAddr string
 
+	// Sequential, when true, downloads pieces in order (lowest index first)
+	// instead of rarest-first. Required for streaming to ensure the beginning
+	// of the file is available as early as possible.
+	Sequential bool
+
+	// PieceReady, when set, is called immediately after each piece is verified
+	// and submitted to the disk writer. The callback receives the piece index.
+	// Used by the stream package to unblock HTTP range readers.
+	PieceReady func(index int)
+
 	lg *log.Logger
 
 	// Strategy 2 — UCB1: per-peer throughput stats for adaptive pipeline depth.
@@ -181,12 +191,13 @@ func (e *Engine) Download() error {
 	// Open output files and start the async disk-write goroutine.
 	// On Linux, newPieceWriter tries io_uring first and falls back to the
 	// standard WriteAt implementation if the kernel doesn't support it.
-	dw, err := newPieceWriter(e.Info, e.Output)
+	dw, err := newPieceWriter(e.Info, e.Output, e.PieceReady)
 	if err != nil {
 		return fmt.Errorf("open output: %w", err)
 	}
 
 	queue := newWorkQueue(e.Info.PieceHashes, e.Info.PieceLength, e.Info.TotalLength())
+	queue.sequential = e.Sequential
 
 	// results carries verified, pool-owned piece buffers to the assembler.
 	// Channel depth = MaxPeers so no worker ever blocks sending a result.
@@ -270,6 +281,8 @@ assemble:
 			}
 
 			// Hand the buffer to the disk writer — async, never blocks the assembler.
+			// PieceReady is called from inside the disk writer after the write
+			// completes so that stream readers don't read stale zeros.
 			dw.Submit(res.index, res.buf)
 			done++
 

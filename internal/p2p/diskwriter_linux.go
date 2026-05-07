@@ -208,24 +208,26 @@ func (r *iouRing) close() {
 // multiple pieces per syscall to eliminate per-write context-switch overhead.
 // Falls back to standard WriteAt if io_uring_setup fails (kernel < 5.1).
 type uringDiskWriter struct {
-	info     *torrent.TorrentInfo
-	files    []*os.File
-	fds      []int32 // cached raw file descriptors (stable while files are open)
-	offsets  []int64
-	totalLen int64
-	pieceLen int64
-	writeC   chan writeReq
-	doneC    chan error
-	wg       sync.WaitGroup
+	info      *torrent.TorrentInfo
+	files     []*os.File
+	fds       []int32 // cached raw file descriptors (stable while files are open)
+	offsets   []int64
+	totalLen  int64
+	pieceLen  int64
+	writeC    chan writeReq
+	doneC     chan error
+	wg        sync.WaitGroup
+	writtenCb func(int) // called after each piece is fully written; may be nil
 }
 
-func newUringDiskWriter(info *torrent.TorrentInfo, output string) (*uringDiskWriter, error) {
+func newUringDiskWriter(info *torrent.TorrentInfo, output string, writtenCb func(int)) (*uringDiskWriter, error) {
 	dw := &uringDiskWriter{
-		info:     info,
-		totalLen: int64(info.TotalLength()),
-		pieceLen: int64(info.PieceLength),
-		writeC:   make(chan writeReq, 256),
-		doneC:    make(chan error, 1),
+		info:      info,
+		totalLen:  int64(info.TotalLength()),
+		pieceLen:  int64(info.PieceLength),
+		writeC:    make(chan writeReq, 256),
+		doneC:     make(chan error, 1),
+		writtenCb: writtenCb,
 	}
 	if info.IsMultiFile() {
 		if err := dw.openMultiFile(info, output); err != nil {
@@ -390,6 +392,9 @@ func (dw *uringDiskWriter) loop() {
 				pp.pinner.Unpin()
 				globalPiecePool.put(pp.buf)
 				delete(inFlight, r.userData)
+				if !pp.hasErr && dw.writtenCb != nil {
+					dw.writtenCb(int(r.userData))
+				}
 			}
 		}
 	}
@@ -441,6 +446,8 @@ func (dw *uringDiskWriter) loopFallback() {
 		if writeErr == nil {
 			if err := dw.writePiece(req.index, req.buf); err != nil {
 				writeErr = err
+			} else if dw.writtenCb != nil {
+				dw.writtenCb(req.index)
 			}
 		}
 		globalPiecePool.put(req.buf)

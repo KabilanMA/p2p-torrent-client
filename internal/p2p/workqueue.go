@@ -49,12 +49,16 @@ func (h *pieceHeap) Pop() any           { old := *h; n := len(old); x := old[n-1
 // next() scans the heap array linearly — O(n) worst-case but cache-friendly,
 // and heap order ensures the rarest pieces appear near the start, so the scan
 // converges quickly for typical connected peers with most pieces available.
+//
+// When sequential is true, next() returns the lowest-indexed piece the peer
+// has rather than the rarest, priming the beginning of the file first for streaming.
 type workQueue struct {
-	mu      sync.Mutex
-	h       pieceHeap
-	byIndex map[int]*heapItem
-	avail   []int32 // peer availability count per piece (shadow of heap keys)
-	total   int
+	mu         sync.Mutex
+	h          pieceHeap
+	byIndex    map[int]*heapItem
+	avail      []int32 // peer availability count per piece (shadow of heap keys)
+	total      int
+	sequential bool // stream mode: prefer low-index pieces over rarest
 }
 
 func newWorkQueue(pieces [][20]byte, pieceLen, totalLen int) *workQueue {
@@ -91,25 +95,37 @@ func (q *workQueue) registerBitfield(bf bitfield.Bitfield) {
 	heap.Init(&q.h) // O(n) rebuild — correct and cheaper than n×Fix()
 }
 
-// next returns the rarest pending piece that peer bf has, or nil if none.
-// The heap is ordered rarest-first so scanning from index 0 finds a good
-// candidate quickly for well-seeded peers.
+// next returns the next pending piece that peer bf has, or nil if none.
+// In rarest-first mode (default) it returns the rarest piece the peer has.
+// In sequential mode it returns the lowest-indexed piece the peer has so that
+// the beginning of the file is ready for playback as early as possible.
 func (q *workQueue) next(bf bitfield.Bitfield) *pieceWork {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	best := -1
-	var bestAvail int32 = math.MaxInt32
 
-	for i, item := range q.h {
-		if bf.HasPiece(item.pw.index) && item.avail < bestAvail {
-			bestAvail = item.avail
-			best = i
-			if bestAvail == 0 {
-				break // can't do better than exclusive ownership
+	if q.sequential {
+		bestIndex := math.MaxInt32
+		for i, item := range q.h {
+			if bf.HasPiece(item.pw.index) && item.pw.index < bestIndex {
+				bestIndex = item.pw.index
+				best = i
+			}
+		}
+	} else {
+		var bestAvail int32 = math.MaxInt32
+		for i, item := range q.h {
+			if bf.HasPiece(item.pw.index) && item.avail < bestAvail {
+				bestAvail = item.avail
+				best = i
+				if bestAvail == 0 {
+					break // can't do better than exclusive ownership
+				}
 			}
 		}
 	}
+
 	if best == -1 {
 		return nil
 	}

@@ -316,6 +316,155 @@ select option { background: var(--surface); }
 }
 .input-error { animation: shake .3s ease; border-color: var(--danger) !important; }
 
+/* ── Stream modal ── */
+#stream-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,.82);
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#stream-container {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  width: min(92vw, 960px);
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+#stream-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+#stream-title {
+  font-weight: 600;
+  font-size: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 60%;
+}
+#stream-header-btns { display: flex; gap: 8px; align-items: center; }
+#stream-body {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  min-height: 0;
+}
+#stream-video-wrap {
+  flex: 1;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+}
+#stream-video {
+  width: 100%;
+  max-height: 70vh;
+  outline: none;
+}
+#stream-playlist-panel {
+  width: 220px;
+  border-left: 1px solid var(--border);
+  overflow-y: auto;
+  flex-shrink: 0;
+  padding: 8px 0;
+}
+.playlist-item {
+  padding: 9px 14px;
+  font-size: 12px;
+  cursor: pointer;
+  border-left: 3px solid transparent;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background .1s;
+  color: var(--muted);
+}
+.playlist-item:hover { background: rgba(255,255,255,.04); color: var(--text); }
+.playlist-item.active { border-left-color: var(--accent2); color: var(--text); font-weight: 600; }
+#stream-footer {
+  padding: 10px 18px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+#stream-buf-track {
+  flex: 1;
+  background: var(--border);
+  border-radius: 99px;
+  height: 4px;
+  overflow: hidden;
+}
+#stream-buf-bar {
+  height: 100%;
+  width: 0%;
+  background: var(--accent2);
+  border-radius: 99px;
+  transition: width .5s ease;
+}
+#stream-buf-text {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  font-family: var(--mono);
+  min-width: 120px;
+}
+#stream-preparing {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 60px 20px;
+  color: var(--muted);
+  font-size: 13px;
+  text-align: center;
+}
+.spinner {
+  width: 36px; height: 36px;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent2);
+  border-radius: 50%;
+  animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── No-playable popup ── */
+#noplay-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,.7);
+  z-index: 110;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#noplay-box {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 28px 30px;
+  max-width: 400px;
+  width: 90%;
+  text-align: center;
+}
+#noplay-box h3 { margin-bottom: 10px; font-size: 16px; }
+#noplay-box p  { font-size: 13px; color: var(--muted); margin-bottom: 20px; line-height: 1.6; }
+#noplay-box .btn { margin-top: 6px; }
+
+/* ── Watch button variant ── */
+.btn-watch { background: #8957e5; color: #fff; }
+
 /* ── Toast ── */
 #toast {
   position: fixed;
@@ -417,7 +566,10 @@ select option { background: var(--surface); }
     </div>
   </details>
 
-  <button class="btn btn-primary" id="add-btn">▶&nbsp; Add to Queue</button>
+  <div style="display:flex;gap:10px;margin-top:14px">
+    <button class="btn btn-primary" id="add-btn" style="margin-top:0;flex:1">▶&nbsp; Add to Queue</button>
+    <button class="btn btn-watch btn-sm" id="watch-btn" style="padding:9px 20px;font-size:14px;font-weight:600">▶&nbsp; Watch</button>
+  </div>
 </div>
 
 <!-- ── Download Queue ─────────────────────────────────────────────────────── -->
@@ -442,6 +594,50 @@ select option { background: var(--surface); }
 </div>
 
 </div><!-- /.layout -->
+
+<!-- ── Stream player modal ──────────────────────────────────────────────────── -->
+<div id="stream-overlay" style="display:none">
+  <div id="stream-container">
+    <div id="stream-header">
+      <span id="stream-title">Loading…</span>
+      <div id="stream-header-btns">
+        <button class="btn btn-secondary btn-sm" id="stream-save-btn" style="display:none" onclick="streamSave()">💾 Save to Disk</button>
+        <button class="btn btn-danger btn-sm" onclick="closeStream()">✕ Close</button>
+      </div>
+    </div>
+
+    <div id="stream-body">
+      <!-- Preparing state (archive extraction / initial buffering) -->
+      <div id="stream-preparing">
+        <div class="spinner"></div>
+        <div id="stream-preparing-text">Preparing stream…</div>
+      </div>
+
+      <!-- Video + optional playlist (hidden until ready) -->
+      <div id="stream-video-wrap" style="display:none">
+        <video id="stream-video" controls autoplay>
+          Your browser does not support the video tag.
+        </video>
+      </div>
+      <div id="stream-playlist-panel" style="display:none"></div>
+    </div>
+
+    <div id="stream-footer">
+      <div id="stream-buf-track"><div id="stream-buf-bar"></div></div>
+      <span id="stream-buf-text">Buffering…</span>
+    </div>
+  </div>
+</div>
+
+<!-- ── No-playable popup ─────────────────────────────────────────────────────── -->
+<div id="noplay-overlay" style="display:none">
+  <div id="noplay-box">
+    <h3>No Playable Files</h3>
+    <p id="noplay-msg">This torrent does not contain any playable video files.<br>Would you like to download it to disk instead?</p>
+    <button class="btn btn-primary" style="margin-top:0" onclick="noplayDownload()">⬇ Download Normally</button>
+    <button class="btn" style="background:var(--border);color:var(--text);width:100%;margin-top:8px" onclick="closeNoplay()">Cancel</button>
+  </div>
+</div>
 
 <div id="toast"></div>
 
@@ -941,6 +1137,224 @@ function showToast(msg) {
   t.classList.add('show');
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => t.classList.remove('show'), 3500);
+}
+
+// ── Streaming ────────────────────────────────────────────────────────────────
+let activeStreamID = null;
+let streamFiles    = [];
+let activeFileIdx  = 0;
+let bufPollTimer   = null;
+
+// SSE events from streaming sessions.
+evtSource.addEventListener('stream_progress', e => {
+  const d = JSON.parse(e.data);
+  if (d.id !== activeStreamID) return;
+  updateStreamBuf(d.done, d.total);
+});
+evtSource.addEventListener('stream_done', e => {
+  const d = JSON.parse(e.data);
+  if (d.id !== activeStreamID) return;
+  updateStreamBuf(1, 1);
+  document.getElementById('stream-save-btn').style.display = '';
+  document.getElementById('stream-buf-text').textContent   = '✓ Fully downloaded';
+});
+evtSource.addEventListener('stream_ready', e => {
+  // Archive extracted — now show the player.
+  const d = JSON.parse(e.data);
+  if (d.id !== activeStreamID) return;
+  streamFiles = d.files || [];
+  showStreamPlayer();
+});
+evtSource.addEventListener('stream_error', e => {
+  const d = JSON.parse(e.data);
+  if (d.id !== activeStreamID) return;
+  appendLog('[stream] ' + d.message, 'error', 'stream');
+  document.getElementById('stream-buf-text').textContent = '⚠ Error: ' + d.message;
+});
+evtSource.addEventListener('stream_saved', e => {
+  const d = JSON.parse(e.data);
+  if (d.id !== activeStreamID) return;
+  showToast('✓ Saved to ' + d.output);
+});
+evtSource.addEventListener('stream_save_error', e => {
+  const d = JSON.parse(e.data);
+  if (d.id !== activeStreamID) return;
+  showToast('⚠ Save failed: ' + d.message);
+});
+
+// Watch button handler.
+document.getElementById('watch-btn').addEventListener('click', startWatch);
+
+async function startWatch() {
+  const activeTab = document.querySelector('.tab.active').dataset.tab;
+  const btn = document.getElementById('watch-btn');
+
+  // Build the same FormData as addToQueue but without output_dir.
+  const fd = new FormData();
+  fd.append('source_type', activeTab);
+  fd.append('max_peers',   document.getElementById('max-peers').value);
+  fd.append('verbose',     document.getElementById('verbose').value);
+
+  if (activeTab === 'file') {
+    if (!torrentFile) { showToast('Please select a .torrent file first.'); return; }
+    fd.append('torrent_file', torrentFile);
+  } else if (activeTab === 'magnet') {
+    const m = document.getElementById('magnet-url').value.trim();
+    if (!m.startsWith('magnet:')) { showToast('Please enter a valid magnet link.'); return; }
+    fd.append('magnet_url', m);
+  } else {
+    showToast('URL tab: select a magnet from the list, then switch to Magnet tab to Watch.');
+    return;
+  }
+
+  btn.disabled    = true;
+  btn.textContent = 'Starting…';
+
+  try {
+    const resp = await fetch('/api/stream', { method: 'POST', body: fd });
+
+    if (resp.status === 422) {
+      const d = await resp.json();
+      showNoplay(d.name || 'this torrent');
+      return;
+    }
+    if (!resp.ok) {
+      showToast('⚠ ' + (await resp.text()).trim());
+      return;
+    }
+
+    const d = await resp.json();
+    activeStreamID = d.id;
+    streamFiles    = d.files || [];
+    activeFileIdx  = 0;
+
+    document.getElementById('stream-title').textContent = d.name || 'Stream';
+    document.getElementById('stream-save-btn').style.display = 'none';
+    document.getElementById('stream-overlay').style.display  = 'flex';
+
+    if (d.has_archive) {
+      // Show "Preparing archive…" spinner until stream_ready fires.
+      document.getElementById('stream-preparing-text').textContent =
+        'Downloading and extracting archive… this may take a while.';
+      showStreamPreparing();
+    } else {
+      showStreamPlayer();
+    }
+
+  } catch (e) {
+    showToast('Network error: ' + e.message);
+  } finally {
+    btn.disabled    = false;
+    btn.textContent = '▶  Watch';
+  }
+}
+
+function showStreamPreparing() {
+  document.getElementById('stream-preparing').style.display   = '';
+  document.getElementById('stream-video-wrap').style.display  = 'none';
+  document.getElementById('stream-playlist-panel').style.display = 'none';
+}
+
+function showStreamPlayer() {
+  document.getElementById('stream-preparing').style.display   = 'none';
+  document.getElementById('stream-video-wrap').style.display  = '';
+
+  // Build playlist panel when there are multiple files.
+  const panel = document.getElementById('stream-playlist-panel');
+  if (streamFiles.length > 1) {
+    panel.style.display = '';
+    panel.innerHTML = streamFiles.map((f, i) =>
+      '<div class="playlist-item' + (i === activeFileIdx ? ' active' : '') + '" ' +
+      'onclick="playStreamFile(' + i + ')" title="' + escHtml(f.name) + '">' +
+      escHtml(shortFileName(f.name)) + '</div>'
+    ).join('');
+  } else {
+    panel.style.display = 'none';
+  }
+
+  loadStreamFile(activeFileIdx);
+}
+
+function playStreamFile(idx) {
+  activeFileIdx = idx;
+  // Update playlist highlight.
+  document.querySelectorAll('.playlist-item').forEach((el, i) => {
+    el.classList.toggle('active', i === idx);
+  });
+  loadStreamFile(idx);
+}
+
+function loadStreamFile(idx) {
+  if (!activeStreamID || idx >= streamFiles.length) return;
+  const f   = streamFiles[idx];
+  const url = '/api/stream/' + activeStreamID + '/file/' + idx;
+  const vid = document.getElementById('stream-video');
+  vid.src  = url;
+  vid.load();
+  vid.play().catch(() => {}); // autoplay may be blocked by browser policy
+}
+
+function updateStreamBuf(done, total) {
+  if (!total) return;
+  const pct = Math.round(done / total * 100);
+  document.getElementById('stream-buf-bar').style.width = pct + '%';
+  document.getElementById('stream-buf-text').textContent =
+    'Buffering ' + pct + '%  (' + done + '/' + total + ' pieces)';
+}
+
+function closeStream() {
+  const vid = document.getElementById('stream-video');
+  vid.pause();
+  vid.src = '';
+  document.getElementById('stream-overlay').style.display = 'none';
+  if (activeStreamID) {
+    fetch('/api/stream/' + activeStreamID, { method: 'DELETE' });
+    activeStreamID = null;
+  }
+  streamFiles   = [];
+  activeFileIdx = 0;
+}
+
+async function streamSave() {
+  const outputDir = document.getElementById('output-dir').value.trim();
+  if (!outputDir) {
+    showToast('Please fill in an output directory first.');
+    return;
+  }
+  if (!activeStreamID) return;
+  await fetch('/api/stream/' + activeStreamID + '/save', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ output_dir: outputDir }),
+  });
+  showToast('Saving to ' + outputDir + '…');
+}
+
+// ── No-playable popup ─────────────────────────────────────────────────────────
+let pendingNoplayName = '';
+
+function showNoplay(name) {
+  pendingNoplayName = name;
+  document.getElementById('noplay-msg').innerHTML =
+    '<strong>' + escHtml(name) + '</strong> does not contain any playable video files.<br>' +
+    'Would you like to download it to disk instead?';
+  document.getElementById('noplay-overlay').style.display = 'flex';
+}
+
+function closeNoplay() {
+  document.getElementById('noplay-overlay').style.display = 'none';
+}
+
+async function noplayDownload() {
+  closeNoplay();
+  // Switch to queue mode — reuse the existing addToQueue flow.
+  await addToQueue();
+}
+
+function shortFileName(name) {
+  const parts = name.split(/[/\\]/);
+  const base  = parts[parts.length - 1];
+  return base.length > 28 ? base.slice(0, 26) + '…' : base;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

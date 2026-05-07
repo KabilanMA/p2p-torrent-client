@@ -4,6 +4,6 @@ package p2p
 
 import "github.com/KabilanMA/p2p-torrent-client/internal/torrent"
 
-func newPieceWriter(info *torrent.TorrentInfo, output string) (pieceWriter, error) {
-	return newDiskWriter(info, output)
+func newPieceWriter(info *torrent.TorrentInfo, output string, writtenCb func(int)) (pieceWriter, error) {
+	return newDiskWriter(info, output, writtenCb)
 }
