@@ -83,6 +83,11 @@ type Engine struct {
 	// Used by the stream package to unblock HTTP range readers.
 	PieceReady func(index int)
 
+	// Timeout, when positive, caps the entire download (peer gathering included).
+	// On expiry, the download is cancelled and a descriptive error is returned.
+	// A zero value means no timeout.
+	Timeout time.Duration
+
 	lg *log.Logger
 
 	// Strategy 2 — UCB1: per-peer throughput stats for adaptive pipeline depth.
@@ -161,6 +166,15 @@ func (e *Engine) Download() error {
 	e.initLogger()
 	if e.MaxPeers == 0 {
 		e.MaxPeers = 50
+	}
+
+	// Wrap the base context with a deadline when Timeout is set.
+	// Must happen before any e.ctx() call so workers and the assembler share
+	// the same bounded context.
+	if e.Timeout > 0 {
+		tCtx, tCancel := context.WithTimeout(e.ctx(), e.Timeout)
+		defer tCancel()
+		e.Context = tCtx
 	}
 
 	// Optional pprof server for profiling active downloads.
@@ -325,6 +339,10 @@ assemble:
 	}
 
 	if assembleErr != nil {
+		if assembleErr == context.DeadlineExceeded && e.Timeout > 0 {
+			return fmt.Errorf("timed out after %s — %d/%d pieces downloaded; check connectivity or increase -timeout",
+				e.Timeout.Round(time.Second), done, total)
+		}
 		return assembleErr
 	}
 	if done < total {

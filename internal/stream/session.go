@@ -71,6 +71,7 @@ func (s *Session) Files() []PlayableFile {
 func (s *Session) Start(
 	ctx context.Context,
 	maxPeers, verbose int,
+	timeout time.Duration,
 	logFunc func(string),
 	progressFunc func(done, total int, speedMBps float64),
 	pieceReadyCb func(int),
@@ -93,6 +94,7 @@ func (s *Session) Start(
 		MaxPeers:   maxPeers,
 		Verbose:    verbose,
 		Context:    ctx,
+		Timeout:    timeout,
 		LogFunc:    logFunc,
 		Sequential: true,
 		PieceReady: func(index int) {

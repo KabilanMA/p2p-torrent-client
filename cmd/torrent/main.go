@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/KabilanMA/p2p-torrent-client/internal/metadata"
 	"github.com/KabilanMA/p2p-torrent-client/internal/p2p"
@@ -24,6 +25,8 @@ func main() {
 		"\t1  normal  — banner, peer count, progress every 5%, summary\n"+
 		"\t2  verbose — per-tracker results, every piece, peer connect/disconnect\n"+
 		"\t3  debug   — per-block requests, all peer messages, DHT details")
+	timeout := flag.Duration("timeout", 10*time.Minute,
+		"Maximum time for the entire download (0 = no limit). e.g. 30m, 1h, 2h30m")
 	flag.Usage = usage
 	flag.Parse()
 
@@ -72,6 +75,7 @@ func main() {
 		Output:   *output,
 		MaxPeers: *maxPeers,
 		Verbose:  *verbose,
+		Timeout:  *timeout,
 	}
 
 	if err := engine.Download(); err != nil {
@@ -175,6 +179,8 @@ Examples:
   torrent -o debian.iso debian-12.torrent
   torrent -o debian.iso -verbose 1 debian-12.torrent
   torrent -o ~/Downloads -peers 100 -verbose 2 "magnet:?xt=urn:btih:..."
-  torrent -o out.iso -verbose 3 ubuntu.torrent     # full debug output
+  torrent -o out.iso -verbose 3 ubuntu.torrent           # full debug output
+  torrent -o ~/Downloads -timeout 1h "magnet:?xt=urn:btih:..."  # 1-hour cap
+  torrent -o ~/Downloads -timeout 0 ubuntu.torrent       # no timeout
 `)
 }

@@ -26,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/KabilanMA/p2p-torrent-client/internal/colab"
 	"github.com/KabilanMA/p2p-torrent-client/internal/metadata"
 	"github.com/KabilanMA/p2p-torrent-client/internal/p2p"
 	"github.com/KabilanMA/p2p-torrent-client/internal/peers"
@@ -210,8 +211,10 @@ func main() {
 	mux.HandleFunc("/api/downloads",       srv.handleDownloads)
 	mux.HandleFunc("/api/cancel",          srv.handleCancel)
 	mux.HandleFunc("/api/events",          srv.handleEvents)
-	mux.HandleFunc("/api/stream",          srv.handleStreamStart)
+	mux.HandleFunc("/api/stream",           srv.handleStreamStart)
 	mux.HandleFunc("/api/stream/",         srv.handleStreamDispatch)
+	mux.HandleFunc("/api/colab/notebook",  srv.handleColabNotebook)
+	mux.HandleFunc("/api/drive-download",  srv.handleDriveDownload)
 
 	addr := fmt.Sprintf("http://%s", ln.Addr())
 	fmt.Printf("Torrent GUI → %s\n", addr)
@@ -571,10 +574,11 @@ func (s *server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sourceType  := r.FormValue("source_type")
-	outputDir   := strings.TrimSpace(r.FormValue("output_dir"))
-	maxPeers, _ := strconv.Atoi(r.FormValue("max_peers"))
-	verbose, _  := strconv.Atoi(r.FormValue("verbose"))
+	sourceType    := r.FormValue("source_type")
+	outputDir     := strings.TrimSpace(r.FormValue("output_dir"))
+	maxPeers, _   := strconv.Atoi(r.FormValue("max_peers"))
+	verbose, _    := strconv.Atoi(r.FormValue("verbose"))
+	dlTimeout, _  := time.ParseDuration(r.FormValue("timeout"))
 	if maxPeers < 1 {
 		maxPeers = 50
 	}
@@ -645,7 +649,7 @@ func (s *server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]string{"id": id})
 
-	go s.runDownload(ctx, dl, source, maxPeers, verbose)
+	go s.runDownload(ctx, dl, source, maxPeers, verbose, dlTimeout)
 }
 
 // handleCancel cancels the download identified by the ?id= query parameter.
@@ -707,7 +711,7 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 // runDownload is the background goroutine that drives one download to completion.
-func (s *server) runDownload(ctx context.Context, dl *dlEntry, source string, maxPeers, verbose int) {
+func (s *server) runDownload(ctx context.Context, dl *dlEntry, source string, maxPeers, verbose int, timeout time.Duration) {
 	defer func() {
 		if dl.sourceType == "file" {
 			os.Remove(source)
@@ -855,6 +859,7 @@ func (s *server) runDownload(ctx context.Context, dl *dlEntry, source string, ma
 		MaxPeers: maxPeers,
 		Verbose:  verbose,
 		Context:  ctx,
+		Timeout:  timeout,
 		LogFunc:  sendLog,
 		ProgressFunc: func(done, total int, speedMBps float64) {
 			dl.mu.Lock()
@@ -918,9 +923,10 @@ func (s *server) handleStreamStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sourceType := r.FormValue("source_type")
-	maxPeers, _ := strconv.Atoi(r.FormValue("max_peers"))
-	verbose, _ := strconv.Atoi(r.FormValue("verbose"))
+	sourceType       := r.FormValue("source_type")
+	maxPeers, _      := strconv.Atoi(r.FormValue("max_peers"))
+	verbose, _       := strconv.Atoi(r.FormValue("verbose"))
+	streamTimeout, _ := time.ParseDuration(r.FormValue("timeout"))
 	if maxPeers < 1 {
 		maxPeers = 50
 	}
@@ -1057,7 +1063,7 @@ func (s *server) handleStreamStart(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	sess.Start(context.Background(), maxPeers, verbose, sendLog, progressFn, nil)
+	sess.Start(context.Background(), maxPeers, verbose, streamTimeout, sendLog, progressFn, nil)
 
 	// If the torrent contains only archive files, wait for full download
 	// in a background goroutine, then extract and notify via SSE.
@@ -1222,6 +1228,254 @@ func (s *server) handleStreamDispatch(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// ── Colab notebook ────────────────────────────────────────────────────────────
+
+// handleColabNotebook generates a Jupyter .ipynb file and sends it as a
+// file-download response. The notebook, when run in Google Colab, downloads
+// the torrent to the user's Google Drive using aria2c.
+func (s *server) handleColabNotebook(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		http.Error(w, "bad form: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	sourceType  := r.FormValue("source_type")
+	driveFolder := r.FormValue("drive_folder")
+	if driveFolder == "" {
+		driveFolder = "TorrentDownloads"
+	}
+
+	var displayName  string
+	var magnetURI    string
+	var torrentBytes []byte
+
+	switch sourceType {
+	case "file":
+		file, header, err := r.FormFile("torrent_file")
+		if err != nil {
+			http.Error(w, "no torrent file: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		defer file.Close()
+		displayName = strings.TrimSuffix(header.Filename, ".torrent")
+		data, err := io.ReadAll(io.LimitReader(file, 100<<20))
+		if err != nil {
+			http.Error(w, "read torrent: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		torrentBytes = data
+	case "magnet":
+		m := strings.TrimSpace(r.FormValue("magnet_url"))
+		if !strings.HasPrefix(m, "magnet:") {
+			http.Error(w, "invalid magnet URI", http.StatusBadRequest)
+			return
+		}
+		magnetURI    = m
+		displayName  = magnetDisplayName(m)
+	default:
+		http.Error(w, "source_type must be 'file' or 'magnet'", http.StatusBadRequest)
+		return
+	}
+
+	nb, err := colab.Notebook(displayName, magnetURI, torrentBytes, driveFolder)
+	if err != nil {
+		http.Error(w, "generate notebook: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	safeBase := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			return r
+		}
+		return '-'
+	}, displayName)
+	if len(safeBase) > 40 {
+		safeBase = safeBase[:40]
+	}
+	filename := "torrent-" + safeBase + ".ipynb"
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", "attachment; filename="+strconv.Quote(filename))
+	w.Write(nb)
+}
+
+// ── Google Drive download ─────────────────────────────────────────────────────
+
+// handleDriveDownload starts an async download of a publicly shared Google
+// Drive file to a local directory. Progress is reported via SSE events.
+func (s *server) handleDriveDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		URL       string `json:"url"`
+		OutputDir string `json:"output_dir"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.URL == "" {
+		http.Error(w, "url is required", http.StatusBadRequest)
+		return
+	}
+	if req.OutputDir == "" {
+		http.Error(w, "output_dir is required", http.StatusBadRequest)
+		return
+	}
+
+	fileID, err := extractDriveFileID(req.URL)
+	if err != nil {
+		http.Error(w, "invalid Google Drive URL: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := os.MkdirAll(req.OutputDir, 0755); err != nil {
+		http.Error(w, "cannot create output dir: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	id := newID()
+	go func() {
+		s.hub.send("drive_start", map[string]string{"id": id})
+		filename, err := downloadGDriveFile(fileID, req.OutputDir, func(dl, total int64) {
+			s.hub.send("drive_progress", map[string]any{
+				"id": id, "downloaded": dl, "total": total,
+			})
+		})
+		if err != nil {
+			s.hub.send("drive_error", map[string]string{"id": id, "message": err.Error()})
+			return
+		}
+		s.hub.send("drive_done", map[string]string{"id": id, "file": filename, "output": req.OutputDir})
+	}()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]string{"id": id})
+}
+
+// extractDriveFileID parses a Google Drive URL and returns the file ID.
+func extractDriveFileID(rawURL string) (string, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", err
+	}
+	// /file/d/{id}/view  or  /file/d/{id}
+	if strings.Contains(u.Path, "/file/d/") {
+		parts := strings.Split(u.Path, "/")
+		for i, p := range parts {
+			if p == "d" && i+1 < len(parts) && parts[i+1] != "" {
+				return parts[i+1], nil
+			}
+		}
+	}
+	// ?id={id}  or  /uc?id={id}  or  /open?id={id}
+	if id := u.Query().Get("id"); id != "" {
+		return id, nil
+	}
+	return "", fmt.Errorf("cannot find file ID in URL %q", rawURL)
+}
+
+// downloadGDriveFile downloads a publicly shared Google Drive file to outputDir.
+// It uses the drive.usercontent.google.com endpoint which handles large-file
+// confirmation without requiring OAuth.
+func downloadGDriveFile(fileID, outputDir string, progressFn func(dl, total int64)) (string, error) {
+	dlURL := "https://drive.usercontent.google.com/download?id=" + fileID + "&export=download&confirm=t"
+
+	client := &http.Client{} // no global timeout — file can be large
+	req, err := http.NewRequest("GET", dlURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; TorrentClient/1.0)")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("drive request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		// good
+	case http.StatusNotFound:
+		return "", fmt.Errorf("file not found (HTTP 404) — check the file ID or share link")
+	case http.StatusForbidden, http.StatusUnauthorized:
+		return "", fmt.Errorf("access denied — share the file as 'Anyone with the link can view'")
+	default:
+		return "", fmt.Errorf("unexpected HTTP %d from Google Drive", resp.StatusCode)
+	}
+
+	// Extract filename from Content-Disposition header.
+	filename := fileID
+	if cd := resp.Header.Get("Content-Disposition"); cd != "" {
+		if fn := parseCDFilename(cd); fn != "" {
+			filename = fn
+		}
+	}
+
+	outPath := filepath.Join(outputDir, filename)
+	f, err := os.Create(outPath)
+	if err != nil {
+		return "", fmt.Errorf("create %s: %w", outPath, err)
+	}
+	defer f.Close()
+
+	total := resp.ContentLength
+	var downloaded int64
+	buf := make([]byte, 32<<10)
+	for {
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := f.Write(buf[:n]); werr != nil {
+				return "", fmt.Errorf("write: %w", werr)
+			}
+			downloaded += int64(n)
+			if progressFn != nil {
+				progressFn(downloaded, total)
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("read: %w", err)
+		}
+	}
+	return filename, nil
+}
+
+// parseCDFilename extracts the filename from a Content-Disposition header value.
+func parseCDFilename(cd string) string {
+	// Try filename*= (RFC 5987) first.
+	if i := strings.Index(cd, "filename*="); i >= 0 {
+		rest := cd[i+10:]
+		if j := strings.IndexByte(rest, ';'); j >= 0 {
+			rest = rest[:j]
+		}
+		if k := strings.LastIndex(rest, "'"); k >= 0 {
+			encoded := strings.TrimSpace(rest[k+1:])
+			if decoded, err := url.QueryUnescape(encoded); err == nil && decoded != "" {
+				return decoded
+			}
+		}
+	}
+	// Fall back to filename=
+	if i := strings.Index(cd, "filename="); i >= 0 {
+		rest := strings.TrimSpace(cd[i+9:])
+		if j := strings.IndexByte(rest, ';'); j >= 0 {
+			rest = rest[:j]
+		}
+		return strings.Trim(strings.TrimSpace(rest), `"`)
+	}
+	return ""
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

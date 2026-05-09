@@ -6,6 +6,8 @@ A fast, resource-efficient BitTorrent client written in Go. Ships as two binarie
 
 Four research-backed speed strategies are built into the download engine: BBR congestion control, UCB1 multi-armed bandit peer selection, Linux io_uring async disk I/O, and Random Linear Network Coding (RLNC) infrastructure — all described in detail [below](#speed-optimization-strategies).
 
+When your local internet is too slow or peers are hard to reach, the **Google Colab** workflow lets you offload the torrent download to Google's servers, save the result to your Google Drive, and pull it back locally with one click — all from inside the GUI.
+
 ---
 
 ## Features
@@ -27,12 +29,15 @@ Four research-backed speed strategies are built into the download engine: BBR co
 - TCP tuning: `SetNoDelay`, 1 MiB read buffer, 512 KiB write buffer
 - Endgame mode: last ≤20 pieces broadcast to all peers simultaneously
 - SHA-1 verification bounded to `NumCPU` goroutines
+- **Configurable timeout** — cap the entire download; get a clear error with progress on expiry
 - Context-based cancellation that force-closes TCP connections immediately
 - Transparent gzip decompression for torrent files and tracker responses
 - Optional pprof HTTP server for live profiling
 - Browser GUI with concurrent download queue and real-time SSE progress
 - URL scanner: paste any web page URL and the GUI extracts and resolves magnet links
 - **In-browser video streaming** — watch any video torrent or magnet link directly without saving to disk
+- **Google Colab notebook generator** — one click exports a ready-to-run `.ipynb` that downloads the torrent to your Google Drive via Google's servers
+- **Download from Google Drive** — paste a Drive share link and pull the file to your local machine
 
 ---
 
@@ -67,6 +72,7 @@ torrent -o <output> [options] <torrent-file|magnet-link>
 |---|---|---|
 | `-o` | *(required)* | Output file path (single-file torrent) or directory (multi-file torrent) |
 | `-peers` | `50` | Maximum concurrent peer connections |
+| `-timeout` | `10m` | Maximum time for the entire download. `0` disables the limit. Accepts Go duration strings: `30s`, `1h`, `2h30m` |
 | `-verbose` | `0` | Verbosity level (see below) |
 
 **Verbosity levels:**
@@ -92,6 +98,18 @@ torrent -o <output> [options] <torrent-file|magnet-link>
 
 # Full debug output
 ./torrent -o out.iso -verbose 3 file.torrent
+
+# Allow up to 1 hour before giving up
+./torrent -o ~/Downloads -timeout 1h "magnet:?xt=urn:btih:..."
+
+# No timeout — run until complete or cancelled
+./torrent -o ~/Downloads -timeout 0 large.torrent
+```
+
+When the timeout fires, the CLI prints a message like:
+
+```
+timed out after 10m — 47/200 pieces downloaded; check connectivity or increase -timeout
 ```
 
 ---
@@ -114,6 +132,41 @@ The GUI runs a local HTTP server and serves a single-page app. Features:
 - Multiple simultaneous downloads
 - Reconnect-safe: new browser tabs replay the current queue state on connect
 - Global log panel with per-download tagged output
+- **Timeout field** in Options — set a per-download deadline (default `10m`, enter `0` to disable)
+- **Watch** button — stream video files directly in the browser without saving to disk
+- **☁ Colab** button — generate a Jupyter notebook that downloads the torrent on Google's servers to your Google Drive
+- **Download from Google Drive** card — pull a Drive-hosted file to your local machine by pasting its share URL
+
+### Options panel
+
+Expand **Options** under any source tab to configure:
+
+| Option | Default | Notes |
+|---|---|---|
+| Max Peers | `50` | Maximum concurrent BitTorrent peer connections |
+| Timeout | `10m` | Download deadline. `0` = no limit. Accepts: `30s`, `1h`, `2h30m` |
+| Verbosity | `1` | Controls detail level in the log panel |
+
+---
+
+## Download Timeout
+
+Both the CLI and GUI apply a single deadline to the **entire download lifecycle** — peer gathering, metadata fetch (for magnet links), and piece transfer are all bounded by the same timer. When the deadline fires:
+
+- All TCP connections are force-closed immediately.
+- The engine reports exactly how many pieces were downloaded before giving up.
+- The error message tells you to check connectivity or increase the timeout.
+
+**When to change the default:**
+
+| Scenario | Recommendation |
+|---|---|
+| Healthy torrent with many seeders | Default `10m` is plenty |
+| Rare or old torrent, few seeders | Try `1h` or `2h` |
+| Unattended overnight download | `-timeout 0` (no limit) |
+| Quick test / CI script | `-timeout 2m` |
+
+The timeout wraps the engine's `context.Context`, so cancellation propagates everywhere — no goroutine is left orphaned after expiry.
 
 ---
 
@@ -123,7 +176,7 @@ The GUI has a **Watch** mode that lets you play video files directly in the brow
 
 ### How it works
 
-1. Click **Watch** instead of **Download** for any `.torrent` file or magnet link.
+1. Click **Watch** instead of **Add to Queue** for any `.torrent` file or magnet link.
 2. The GUI resolves metadata (if needed), scans the torrent for playable files, and starts a streaming session.
 3. Pieces are fetched in sequential order so early pieces of the file arrive first, allowing playback to begin within seconds.
 4. A `PieceWaiter` gate blocks each read from the browser's video element until the underlying torrent pieces have been verified and written — the browser never sees incomplete data.
@@ -171,6 +224,135 @@ SSE events emitted during a streaming session: `stream_progress`, `stream_log`, 
 
 ---
 
+## Cloud Download via Google Colab
+
+If your local internet connection is slow, you're behind a restrictive NAT, or peers consistently fail to connect from your machine, the **Colab workflow** lets you run the torrent download on Google's infrastructure instead.
+
+Google Colab VMs have fast, well-peered internet connections and are treated as data-centre traffic by most torrent trackers — meaning they find peers quickly and sustain high throughput on torrents that crawl locally.
+
+### Workflow overview
+
+```
+Your machine                  Google Colab VM              Google Drive
+─────────────                 ────────────────             ────────────
+① Click ☁ Colab         →    ② Open .ipynb in Colab
+                              ③ Run cells (aria2c download)  →  ④ File in Drive
+⑥ Click "Download Locally"  ←                             ←  ⑤ Get share link
+```
+
+### Step-by-step instructions
+
+**Step 1 — Generate the notebook**
+
+1. Open the GUI (`./torrent-gui`).
+2. In the **Add Download** card, switch to the **Torrent File** or **Magnet Link** tab and enter your source.
+3. Click **☁ Colab**. A `.ipynb` file is downloaded to your machine immediately (no output directory required).
+
+**Step 2 — Run the notebook in Google Colab**
+
+1. Go to [colab.research.google.com](https://colab.research.google.com).
+2. Open the downloaded `.ipynb` file (**File → Upload notebook**).
+3. Run each cell in order:
+
+| Cell | What it does |
+|---|---|
+| **Mount Drive** | Asks you to authorise Colab to access your Google Drive |
+| **Create output directory** | Creates `My Drive/TorrentDownloads` (or your chosen folder) |
+| **Install aria2c** | Installs the download manager from the Ubuntu package repo (~5 seconds) |
+| **Write torrent file** | *(`.torrent` sources only)* Decodes the embedded base64 torrent and writes it to `/tmp/download.torrent` |
+| **Download** | Runs `aria2c` with DHT enabled, 16 parallel connections, and no seeding — saves directly to Google Drive |
+| **List files** | Prints every downloaded file with its size |
+
+Typical download times on Colab are 5–50× faster than a home connection for popular torrents.
+
+**Step 3 — Get the file back locally**
+
+After the notebook finishes, the file is in your Google Drive under `TorrentDownloads/`. You have two options:
+
+**Option A — Download directly from drive.google.com**
+
+1. Open [drive.google.com](https://drive.google.com) in your browser.
+2. Navigate to **TorrentDownloads**.
+3. Right-click the file → **Download**.
+
+**Option B — Use the GUI's "Download from Google Drive" card** *(see [next section](#download-from-google-drive))*
+
+1. In drive.google.com, right-click the file → **Share** → **Copy link** (make sure it is set to *Anyone with the link can view*).
+2. In the GUI, scroll to the **Download from Google Drive** card.
+3. Paste the share URL, choose an output directory, and click **⬇ Download Locally from Drive**.
+
+### What the notebook generates
+
+The notebook uses `aria2c` with the following settings for maximum speed on Colab:
+
+```
+aria2c
+  --enable-dht=true             # DHT peer discovery (helps when trackers miss peers)
+  --seed-time=0                 # stop immediately after download (no seeding)
+  --max-connection-per-server=16
+  --split=16                    # 16 parallel connections per file
+  --min-split-size=1M
+  --file-allocation=none        # skip pre-allocation (faster on Drive FUSE mount)
+  --bt-enable-lpd=false         # disable local peer discovery (not useful in Colab)
+  --console-log-level=notice
+  --dir=<Google Drive folder>
+  <magnet URI or .torrent path>
+```
+
+### Changing the Drive folder
+
+The default destination folder is `TorrentDownloads`. To change it, edit the `drive_folder` variable in the notebook's **Create output directory** cell before running, or pass a custom value in a future version of the generator.
+
+### Limitations
+
+- Google Colab's free tier has session time limits (typically 12 hours). Very large torrents may need Colab Pro or a paid plan.
+- Files shared via Google Drive must be set to *Anyone with the link can view* for Option B (GUI download) to work. Files that require Google account sign-in cannot be fetched without OAuth.
+- The Colab notebook is generated fresh each time you click ☁ Colab; it always reflects the current torrent source in the form.
+
+---
+
+## Download from Google Drive
+
+The **Download from Google Drive** card at the bottom of the GUI lets you pull any publicly shared Drive file straight to your local machine — no browser, no manual save-as dialog. This is the final step of the Colab workflow, but it also works for any Drive file someone has shared with you.
+
+### How to use it
+
+1. In Google Drive, right-click the file → **Share** → change to **Anyone with the link** → **Copy link**.  
+   The URL looks like `https://drive.google.com/file/d/1aBcDeFgHiJkLmN/view?usp=sharing`.
+2. In the GUI, scroll to **Download from Google Drive**.
+3. Paste the URL into the **Google Drive Share URL** field.
+4. Click **Browse…** or type a local path into **Save to Directory**.
+5. Click **⬇ Download Locally from Drive**.
+
+A progress bar appears immediately, showing bytes downloaded and total size. When the download completes, a toast notification shows the saved filename and location.
+
+### Supported URL formats
+
+| URL format | Supported |
+|---|---|
+| `https://drive.google.com/file/d/{id}/view` | ✓ |
+| `https://drive.google.com/file/d/{id}/view?usp=sharing` | ✓ |
+| `https://drive.google.com/open?id={id}` | ✓ |
+| `https://drive.google.com/uc?id={id}` | ✓ |
+| `https://drive.google.com/drive/folders/{id}` | ✗ (folders not supported) |
+
+### How it works internally
+
+The downloader calls `https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t`. The `confirm=t` parameter bypasses Google's large-file virus-scan confirmation page, allowing direct streaming without OAuth or cookies. The `Content-Disposition` header returned by Drive is parsed to recover the original filename.
+
+**Requirements:** The file must be shared as *Anyone with the link can view*. Private files (those requiring a Google account) are not supported without OAuth integration.
+
+### SSE events
+
+| Event | Payload | Meaning |
+|---|---|---|
+| `drive_start` | `{id}` | Download goroutine started |
+| `drive_progress` | `{id, downloaded, total}` | Bytes downloaded so far |
+| `drive_done` | `{id, file, output}` | Completed; `file` is the saved filename |
+| `drive_error` | `{id, message}` | Download failed with reason |
+
+---
+
 ## Architecture
 
 ```
@@ -181,13 +363,15 @@ internal/
   bitfield/       Bitfield operations (HasPiece, SetPiece, Count)
   client/         TCP peer connection — handshake, buffered sends, ReadMsg
     bbr_linux.go  BBR congestion control via TCP_CONGESTION socket option
+  colab/          Jupyter notebook generator for Google Colab cloud downloads
+    notebook.go   Builds .ipynb JSON — embeds magnet URI or base64 .torrent bytes
   coding/         RLNC infrastructure — GF(2⁸) arithmetic, encoder, decoder
   dht/            DHT bootstrap peer discovery
   handshake/      BitTorrent handshake serialisation
   message/        Wire protocol messages — pooled body buffers, Release/CopyPayload
   metadata/       BEP 9 metadata extension — fetches info dict from peers
   p2p/            Download engine
-    p2p.go          Engine, UCB1-aware worker goroutines, assembler loop, endgame
+    p2p.go          Engine (+ Timeout field), UCB1-aware workers, assembler, endgame
     peerstats.go    Per-peer EWMA throughput tracker + UCB1 backlog formula
     workqueue.go    Rarest-first min-heap queue + connTracker (sequential mode flag)
     diskwriter.go   Async disk writer — standard WriteAt path (non-Linux)
@@ -208,7 +392,7 @@ internal/
 Trackers / DHT
       │ peers
       ▼
-  runWorker (×MaxPeers goroutines)
+  runWorker (×MaxPeers goroutines)         ← context.WithTimeout if Timeout > 0
   ┌─────────────────────────────┐
   │  BBR socket option (Linux)  │
   │  UCB1 pipeline depth        │  ← adaptive backlog 16–64 per peer
@@ -252,6 +436,8 @@ Trackers / DHT
 **Pipelining.** Each worker pre-fills a pipeline of outstanding REQUEST messages before reading responses. All REQUESTs go out as a single `conn.Write` syscall via `bufio.Writer`. `SetNoDelay(true)` is mandatory — Nagle's algorithm would otherwise batch 17-byte REQUESTs for up to 200 ms.
 
 **Endgame mode.** When ≤20 pieces remain, all outstanding pieces are broadcast to every connected peer simultaneously. A separate `sent[]` atomic array (distinct from the assembler's `written[]` gate) prevents duplicate sends across concurrent goroutines. The assembler remains the sole writer of `written[i]=true`, ensuring its Swap-based dedup correctly counts every piece exactly once.
+
+**Timeout.** `context.WithTimeout` wraps the engine's base context at the very start of `Download()`, before peer gathering begins. Every goroutine — workers, the assembler, the connection closer — shares the same deadline. On expiry the error message includes how many pieces completed, so the user knows exactly how far the download got.
 
 **Cancellation.** `context.Context` propagates cancellation into TCP connections via `connTracker.closeAll()`, which force-closes every socket. This unblocks goroutines stuck in `ReadMsg()` immediately without waiting for 30-second TCP deadlines.
 
@@ -419,7 +605,7 @@ go tool pprof http://localhost:6060/debug/pprof/heap      # memory
 |---|---|
 | [`github.com/jackpal/bencode-go`](https://github.com/jackpal/bencode-go) | Bencode encoding/decoding for .torrent files and tracker responses |
 
-All other functionality — HTTP/UDP trackers, DHT, SSE, TCP tuning, SHA-1, io_uring syscalls, buffer pools — uses the Go standard library and `golang.org/x/sys/unix`.
+All other functionality — HTTP/UDP trackers, DHT, SSE, TCP tuning, SHA-1, io_uring syscalls, buffer pools, Colab notebook generation, Google Drive download — uses the Go standard library and `golang.org/x/sys/unix`.
 
 ---
 

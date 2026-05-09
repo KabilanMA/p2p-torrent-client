@@ -463,7 +463,30 @@ select option { background: var(--surface); }
 #noplay-box .btn { margin-top: 6px; }
 
 /* ── Watch button variant ── */
-.btn-watch { background: #8957e5; color: #fff; }
+.btn-watch  { background: #8957e5; color: #fff; }
+.btn-colab  { background: #f9ab00; color: #000; }
+.btn-drive  { background: #1a73e8; color: #fff; }
+
+/* ── Drive card progress ── */
+#drive-progress-wrap {
+  margin-top: 10px;
+  display: none;
+}
+#drive-progress-bar-wrap {
+  background: var(--border);
+  border-radius: 99px;
+  height: 6px;
+  overflow: hidden;
+  margin-bottom: 6px;
+}
+#drive-progress-bar {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #1a73e8, var(--accent));
+  border-radius: 99px;
+  transition: width .4s ease;
+}
+#drive-progress-text { font-size: 12px; color: var(--muted); font-family: var(--mono); }
 
 /* ── Toast ── */
 #toast {
@@ -555,6 +578,12 @@ select option { background: var(--surface); }
         <input type="number" id="max-peers" value="50" min="1" max="500">
       </div>
       <div>
+        <label for="dl-timeout" title="0 = no limit. Examples: 10m, 1h, 2h30m">Timeout</label>
+        <input type="text" id="dl-timeout" value="10m" placeholder="e.g. 10m, 1h, 0">
+      </div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div>
         <label for="verbose">Verbosity</label>
         <select id="verbose" class="verbose-select">
           <option value="0">0 — Silent (errors only)</option>
@@ -566,9 +595,41 @@ select option { background: var(--surface); }
     </div>
   </details>
 
-  <div style="display:flex;gap:10px;margin-top:14px">
-    <button class="btn btn-primary" id="add-btn" style="margin-top:0;flex:1">▶&nbsp; Add to Queue</button>
-    <button class="btn btn-watch btn-sm" id="watch-btn" style="padding:9px 20px;font-size:14px;font-weight:600">▶&nbsp; Watch</button>
+  <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
+    <button class="btn btn-primary" id="add-btn" style="margin-top:0;flex:1;min-width:140px">▶&nbsp; Add to Queue</button>
+    <button class="btn btn-watch btn-sm" id="watch-btn" style="padding:9px 18px;font-size:14px;font-weight:600">▶&nbsp; Watch</button>
+    <button class="btn btn-colab btn-sm" id="colab-btn" style="padding:9px 18px;font-size:14px;font-weight:600" onclick="generateColabNotebook()">☁&nbsp; Colab</button>
+  </div>
+</div>
+
+<!-- ── Download from Google Drive ───────────────────────────────────────────── -->
+<div class="card" id="drive-card">
+  <div class="card-title">
+    Download from Google Drive
+    <span style="font-size:11px;font-weight:400;color:var(--muted);text-transform:none;letter-spacing:0">
+      paste a share link after your Colab run finishes
+    </span>
+  </div>
+
+  <label for="drive-url">Google Drive Share URL</label>
+  <input type="text" id="drive-url"
+    placeholder="https://drive.google.com/file/d/…/view?usp=sharing"
+    style="font-family:var(--mono);font-size:12px">
+  <div id="drive-url-hint" style="font-size:11px;color:var(--muted);margin-top:4px;min-height:16px"></div>
+
+  <div style="margin-top:12px">
+    <label for="drive-output">Save to Directory</label>
+    <div class="dir-row">
+      <input type="text" id="drive-output" placeholder="Select a directory…">
+      <button class="btn btn-secondary btn-sm" onclick="browseDirInto('drive-output', this)">Browse…</button>
+    </div>
+  </div>
+
+  <button class="btn btn-drive" id="drive-dl-btn" style="margin-top:14px;width:100%;font-size:14px;font-weight:600" onclick="downloadFromDrive()">⬇&nbsp; Download Locally from Drive</button>
+
+  <div id="drive-progress-wrap">
+    <div id="drive-progress-bar-wrap"><div id="drive-progress-bar"></div></div>
+    <div id="drive-progress-text">Starting…</div>
   </div>
 </div>
 
@@ -962,6 +1023,7 @@ async function addToQueue() {
   fd.append('output_dir',  outputDir);
   fd.append('max_peers',   document.getElementById('max-peers').value);
   fd.append('verbose',     document.getElementById('verbose').value);
+  fd.append('timeout',     document.getElementById('dl-timeout').value.trim());
 
   const btn = document.getElementById('add-btn');
   btn.disabled    = true;
@@ -1005,6 +1067,7 @@ async function addToQueue() {
         mfd.append('output_dir',  outputDir);
         mfd.append('max_peers',   document.getElementById('max-peers').value);
         mfd.append('verbose',     document.getElementById('verbose').value);
+        mfd.append('timeout',     document.getElementById('dl-timeout').value.trim());
         mfd.append('magnet_url',  m.magnet);
         const resp = await fetch('/api/download', { method: 'POST', body: mfd });
         if (resp.ok) added++;
@@ -1194,6 +1257,7 @@ async function startWatch() {
   fd.append('source_type', activeTab);
   fd.append('max_peers',   document.getElementById('max-peers').value);
   fd.append('verbose',     document.getElementById('verbose').value);
+  fd.append('timeout',     document.getElementById('dl-timeout').value.trim());
 
   if (activeTab === 'file') {
     if (!torrentFile) { showToast('Please select a .torrent file first.'); return; }
@@ -1355,6 +1419,159 @@ function shortFileName(name) {
   const parts = name.split(/[/\\]/);
   const base  = parts[parts.length - 1];
   return base.length > 28 ? base.slice(0, 26) + '…' : base;
+}
+
+// ── Colab notebook generation ─────────────────────────────────────────────────
+async function generateColabNotebook() {
+  const activeTab = document.querySelector('.tab.active').dataset.tab;
+  if (activeTab === 'url') {
+    showToast('Switch to File or Magnet tab to generate a Colab notebook.');
+    return;
+  }
+
+  const fd = new FormData();
+  fd.append('source_type',  activeTab);
+  fd.append('drive_folder', 'TorrentDownloads');
+
+  if (activeTab === 'file') {
+    if (!torrentFile) { showToast('Please select a .torrent file first.'); return; }
+    fd.append('torrent_file', torrentFile);
+  } else {
+    const m = document.getElementById('magnet-url').value.trim();
+    if (!m.startsWith('magnet:')) { showToast('Please enter a valid magnet link.'); return; }
+    fd.append('magnet_url', m);
+  }
+
+  const btn = document.getElementById('colab-btn');
+  btn.disabled    = true;
+  btn.textContent = '⏳ Generating…';
+
+  try {
+    const resp = await fetch('/api/colab/notebook', { method: 'POST', body: fd });
+    if (!resp.ok) { showToast('⚠ ' + (await resp.text()).trim()); return; }
+
+    const blob = await resp.blob();
+    const cd   = resp.headers.get('Content-Disposition') || '';
+    const m    = cd.match(/filename="?([^";\n]+)"?/);
+    const name = m ? m[1] : 'torrent.ipynb';
+
+    const url = URL.createObjectURL(blob);
+    const a   = document.createElement('a');
+    a.href = url; a.download = name; a.click();
+    URL.revokeObjectURL(url);
+
+    showToast('Notebook saved. Open it in Google Colab to start the download.');
+  } catch (e) {
+    showToast('Network error: ' + e.message);
+  } finally {
+    btn.disabled    = false;
+    btn.textContent = '☁ Colab';
+  }
+}
+
+// ── Google Drive download ─────────────────────────────────────────────────────
+let pendingDriveID = null;
+
+evtSource.addEventListener('drive_progress', e => {
+  const d = JSON.parse(e.data);
+  if (d.id !== pendingDriveID) return;
+  const wrap = document.getElementById('drive-progress-wrap');
+  const bar  = document.getElementById('drive-progress-bar');
+  const txt  = document.getElementById('drive-progress-text');
+  wrap.style.display = 'block';
+  const pct = d.total > 0 ? (d.downloaded / d.total * 100).toFixed(1) : '?';
+  bar.style.width  = (d.total > 0 ? pct : 0) + '%';
+  txt.textContent  = 'Downloading ' + pct + '%  (' + formatBytes(d.downloaded) +
+    (d.total > 0 ? ' / ' + formatBytes(d.total) : '') + ')';
+});
+
+evtSource.addEventListener('drive_done', e => {
+  const d = JSON.parse(e.data);
+  if (d.id !== pendingDriveID) return;
+  pendingDriveID = null;
+  document.getElementById('drive-progress-bar').style.width = '100%';
+  document.getElementById('drive-progress-text').textContent = '✓ Saved: ' + d.file;
+  showToast('✓ "' + d.file + '" saved to ' + d.output);
+  document.getElementById('drive-dl-btn').disabled = false;
+  document.getElementById('drive-dl-btn').textContent = '⬇ Download Locally from Drive';
+});
+
+evtSource.addEventListener('drive_error', e => {
+  const d = JSON.parse(e.data);
+  if (d.id !== pendingDriveID) return;
+  pendingDriveID = null;
+  document.getElementById('drive-progress-text').style.color = '#ff7b72';
+  document.getElementById('drive-progress-text').textContent = '⚠ ' + d.message;
+  showToast('⚠ Drive error: ' + d.message);
+  document.getElementById('drive-dl-btn').disabled = false;
+  document.getElementById('drive-dl-btn').textContent = '⬇ Download Locally from Drive';
+});
+
+async function downloadFromDrive() {
+  const driveURL  = document.getElementById('drive-url').value.trim();
+  const outputDir = document.getElementById('drive-output').value.trim();
+  const hint      = document.getElementById('drive-url-hint');
+
+  hint.textContent = '';
+  if (!driveURL) { hint.textContent = '⚠ Please paste a Google Drive share URL.'; return; }
+  if (!driveURL.includes('drive.google.com')) {
+    hint.textContent = '⚠ URL must be a drive.google.com link.'; return;
+  }
+  if (!outputDir) { showToast('Please select a save directory.'); return; }
+
+  const btn = document.getElementById('drive-dl-btn');
+  btn.disabled    = true;
+  btn.textContent = '⬇ Connecting…';
+
+  const wrap = document.getElementById('drive-progress-wrap');
+  const bar  = document.getElementById('drive-progress-bar');
+  const txt  = document.getElementById('drive-progress-text');
+  wrap.style.display  = 'block';
+  bar.style.width     = '0%';
+  txt.style.color     = 'var(--muted)';
+  txt.textContent     = 'Starting download…';
+
+  try {
+    const resp = await fetch('/api/drive-download', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: driveURL, output_dir: outputDir }),
+    });
+    if (!resp.ok) {
+      txt.textContent = '⚠ ' + (await resp.text()).trim();
+      txt.style.color = '#ff7b72';
+      btn.disabled    = false;
+      btn.textContent = '⬇ Download Locally from Drive';
+      return;
+    }
+    const d = await resp.json();
+    pendingDriveID  = d.id;
+    txt.textContent = 'Downloading…';
+    // btn stays disabled until drive_done / drive_error fires
+  } catch (e) {
+    txt.textContent = '⚠ Network error: ' + e.message;
+    txt.style.color = '#ff7b72';
+    btn.disabled    = false;
+    btn.textContent = '⬇ Download Locally from Drive';
+  }
+}
+
+// Generic dir-picker that writes into any input by ID.
+async function browseDirInto(targetId, btn) {
+  const origText = btn.textContent;
+  btn.disabled    = true;
+  btn.textContent = 'Browsing…';
+  try {
+    const resp = await fetch('/api/browse-dir');
+    if (resp.ok) {
+      const data = await resp.json();
+      document.getElementById(targetId).value = data.path;
+    } else if (resp.status === 501) {
+      showToast('Install zenity (Linux) or type the path manually.');
+    }
+  } catch (_) {}
+  btn.disabled    = false;
+  btn.textContent = origText;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
