@@ -32,6 +32,7 @@ Four research-backed speed strategies are built into the download engine: BBR co
 - Optional pprof HTTP server for live profiling
 - Browser GUI with concurrent download queue and real-time SSE progress
 - URL scanner: paste any web page URL and the GUI extracts and resolves magnet links
+- **In-browser video streaming** — watch any video torrent or magnet link directly without saving to disk
 
 ---
 
@@ -116,6 +117,60 @@ The GUI runs a local HTTP server and serves a single-page app. Features:
 
 ---
 
+## Watching Videos Without Downloading
+
+The GUI has a **Watch** mode that lets you play video files directly in the browser while the torrent downloads in the background. Nothing is written to your permanent disk — the engine downloads into a private temp directory and serves each file over a local HTTP endpoint with full range-request support (seeking works).
+
+### How it works
+
+1. Click **Watch** instead of **Download** for any `.torrent` file or magnet link.
+2. The GUI resolves metadata (if needed), scans the torrent for playable files, and starts a streaming session.
+3. Pieces are fetched in sequential order so early pieces of the file arrive first, allowing playback to begin within seconds.
+4. A `PieceWaiter` gate blocks each read from the browser's video element until the underlying torrent pieces have been verified and written — the browser never sees incomplete data.
+5. When you're done, the temp directory is deleted automatically. Hit **Save** in the player to copy the file(s) to a permanent location first.
+
+### Supported formats
+
+| Extension | MIME type |
+|---|---|
+| `.mp4`, `.m4v` | `video/mp4` |
+| `.mkv` | `video/x-matroska` |
+| `.webm` | `video/webm` |
+| `.avi` | `video/x-msvideo` |
+| `.mov` | `video/quicktime` |
+| `.ts`, `.m2ts` | `video/mp2t` |
+| `.flv` | `video/x-flv` |
+| `.wmv` | `video/x-ms-wmv` |
+| `.mpg`, `.mpeg` | `video/mpeg` |
+| `.ogg`, `.ogv` | `video/ogg` |
+| `.3gp` | `video/3gpp` |
+
+Torrents that contain a `.zip` archive with video files inside are also supported: the engine downloads the archive fully, extracts the video files to a temp sub-directory, then streams them. The browser is notified via a `stream_ready` SSE event when extraction is complete.
+
+### Streaming API (internal)
+
+The GUI exposes these endpoints for its own frontend; they are not intended as a public API but are documented here for completeness.
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/stream` | Start a new streaming session. Returns file list (200) or 202 for archive-only torrents |
+| `GET` | `/api/stream/{id}/file/{idx}` | Stream the i-th playable file with HTTP range support |
+| `GET` | `/api/stream/{id}/status` | `{downloaded, total}` piece counts |
+| `POST` | `/api/stream/{id}/save` | Copy files to `output_dir` (runs in background, notifies via SSE) |
+| `DELETE` | `/api/stream/{id}` | Close session and remove the temp directory |
+
+SSE events emitted during a streaming session: `stream_progress`, `stream_log`, `stream_error`, `stream_done`, `stream_ready`, `stream_saved`, `stream_save_error`.
+
+### Design notes
+
+**Sequential piece ordering.** Normal downloads use rarest-first scheduling. When `Engine.Sequential = true`, the work queue issues pieces in ascending index order instead, so the beginning of the video is always available before the end. This trades some download efficiency for playback latency.
+
+**No disk pollution.** The session writes to `os.MkdirTemp(…)` and calls `os.RemoveAll` on `Session.Close()`. If the user cancels the session or closes the browser tab, the context is cancelled and the temp directory is deleted.
+
+**Range requests and seeking.** `http.ServeContent` handles `Range` headers automatically. The underlying `FileReader.Seek` repositions the read cursor, and `PieceWaiter.WaitRange` blocks only on the pieces actually needed for the seeked position — so jumping to the middle of a video waits only for the pieces at that offset, not everything before it.
+
+---
+
 ## Architecture
 
 ```
@@ -134,11 +189,15 @@ internal/
   p2p/            Download engine
     p2p.go          Engine, UCB1-aware worker goroutines, assembler loop, endgame
     peerstats.go    Per-peer EWMA throughput tracker + UCB1 backlog formula
-    workqueue.go    Rarest-first min-heap queue + connTracker
+    workqueue.go    Rarest-first min-heap queue + connTracker (sequential mode flag)
     diskwriter.go   Async disk writer — standard WriteAt path (non-Linux)
     diskwriter_linux.go  io_uring WRITE path with runtime.Pinner buffer pinning
     pool.go         Piece buffer pool (globalPiecePool)
   peers/          Peer address parsing (compact format)
+  stream/         In-browser video streaming — zero-save-to-disk playback
+    detect.go       Video/archive file scanner, MIME type map, PlayableFile type
+    reader.go       PieceWaiter (cond-var gate) + FileReader (range-safe ReadSeeker)
+    session.go      Session lifecycle — temp dir, p2p engine, ServeFile, Save, Close
   torrent/        .torrent file parser, magnet link parser, TorrentInfo type
   tracker/        HTTP and UDP tracker clients
 ```
@@ -162,6 +221,7 @@ Trackers / DHT
   Assembler goroutine
       │  atomic CAS dedup (written[i])
       │  dw.Submit(index, buf)
+      │  Engine.PieceReady(index)  ← called after each verified piece
       ▼
   diskWriter goroutine
   ┌──────────────────────────────────────────┐
@@ -170,8 +230,17 @@ Trackers / DHT
   │  globalPiecePool.put(buf)                │
   └──────────────────────────────────────────┘
       │
-      ▼
-  Output file(s)
+      ├─────────────────────────────────────────────────────────────────┐
+      ▼                                                                 ▼
+  Output file(s)                                              stream.PieceWaiter
+  (normal download)                                          MarkReady(index)
+                                                                        │
+                                                              unblocks FileReader.Read
+                                                                        │
+                                                              http.ServeContent
+                                                                        │
+                                                              browser <video> element
+                                                              (streaming mode, temp dir)
 ```
 
 ### Key design decisions
